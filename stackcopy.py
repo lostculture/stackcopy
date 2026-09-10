@@ -2737,6 +2737,25 @@ def parse_stacked_image_value(value: Any) -> StackMetadata:
     return StackMetadata(StackMetadataState.UNKNOWN, None, raw_value)
 
 
+def _exiftool_batches(paths: list[str]) -> list[list[str]]:
+    """Split paths into batches that stay below Windows' command-line limit
+    while avoiding the pathological one-process-per-file pattern."""
+    batches: list[list[str]] = []
+    batch: list[str] = []
+    batch_characters = 0
+    for path in paths:
+        path_characters = len(path) + 3
+        if batch and (len(batch) >= 250 or batch_characters + path_characters > 24000):
+            batches.append(batch)
+            batch = []
+            batch_characters = 0
+        batch.append(path)
+        batch_characters += path_characters
+    if batch:
+        batches.append(batch)
+    return batches
+
+
 def read_stacked_image_metadata(jpeg_paths: list[str]) -> dict[str, StackMetadata]:
     """Read Olympus StackedImage MakerNotes in bounded ExifTool batches.
 
@@ -2760,21 +2779,7 @@ def read_stacked_image_metadata(jpeg_paths: list[str]) -> dict[str, StackMetadat
     normalized_to_path = {
         os.path.normcase(os.path.abspath(path)): path for path in jpeg_paths
     }
-    # Stay comfortably below Windows' command-line limit while avoiding the
-    # pathological one-process-per-JPEG pattern.
-    batches: list[list[str]] = []
-    batch: list[str] = []
-    batch_characters = 0
-    for path in jpeg_paths:
-        path_characters = len(path) + 3
-        if batch and (len(batch) >= 250 or batch_characters + path_characters > 24000):
-            batches.append(batch)
-            batch = []
-            batch_characters = 0
-        batch.append(path)
-        batch_characters += path_characters
-    if batch:
-        batches.append(batch)
+    batches = _exiftool_batches(jpeg_paths)
 
     # Reasons this invocation could not read every file, reported once at the
     # end rather than per batch or per file.  Absence of the tag on a healthy
@@ -2869,6 +2874,82 @@ def read_stacked_image_metadata(jpeg_paths: list[str]) -> dict[str, StackMetadat
         )
 
     return results
+
+
+CANON_STACK_TAGS = (
+    "-SubSecDateTimeOriginal",
+    "-Canon:FocusBracketingDepthComposite",
+    "-Canon:FocusBracketingImageCount",
+)
+
+
+def read_canon_stack_metadata(paths: list[str]) -> list["canon_stacks.CanonFrame"]:
+    """Read Canon depth-composite MakerNotes in bounded ExifTool batches.
+
+    Returns one canon_stacks.CanonFrame per readable camera file.  ExifTool is
+    optional: without it every frame is described from its filename alone, with
+    metadata left unknown, and Canon grouping degrades to its cadence
+    heuristic exactly as the Olympus path degrades to its own.
+    """
+    import canon_stacks
+
+    if not paths:
+        return []
+
+    info = exiftool_info()
+    exiftool = info.executable if info.available else None
+    if not exiftool:
+        print(
+            f"Warning: camera stack metadata could not be read for "
+            f"{len(paths)} file(s) (ExifTool is not available). Those files "
+            "fall back to heuristic stack detection."
+        )
+        return canon_stacks.records_from_exiftool_json(
+            [{"SourceFile": path} for path in paths]
+        )
+
+    collected: list[dict] = []
+    degraded_files = 0
+    for batch in _exiftool_batches(paths):
+        try:
+            completed = subprocess.run(
+                [exiftool, "-json", "-n", *CANON_STACK_TAGS, *batch],
+                check=False,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+            )
+        except (subprocess.TimeoutExpired, OSError, subprocess.SubprocessError):
+            degraded_files += len(batch)
+            collected.extend({"SourceFile": path} for path in batch)
+            continue
+        try:
+            payload = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, list):
+            degraded_files += len(batch)
+            collected.extend({"SourceFile": path} for path in batch)
+            continue
+        reported = set()
+        for item in payload:
+            if isinstance(item, dict) and isinstance(item.get("SourceFile"), str):
+                reported.add(os.path.normcase(os.path.abspath(item["SourceFile"])))
+                collected.append(item)
+        for path in batch:
+            if os.path.normcase(os.path.abspath(path)) not in reported:
+                degraded_files += 1
+                collected.append({"SourceFile": path})
+
+    if degraded_files:
+        print(
+            f"Warning: camera stack metadata could not be read for "
+            f"{degraded_files} file(s). Those files fall back to heuristic "
+            "stack detection."
+        )
+    return canon_stacks.records_from_exiftool_json(collected)
 
 
 def main():

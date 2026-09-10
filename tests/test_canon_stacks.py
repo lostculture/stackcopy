@@ -1,10 +1,12 @@
 # tests/test_canon_stacks.py
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 import canon_stacks
+import stackcopy
 
 FIXTURE = Path(__file__).parent / "fixtures" / "canon_108eosr6.json"
 
@@ -294,6 +296,78 @@ def test_composite_with_no_local_frames_reaches_back():
     assert group.confidence == canon_stacks.CONFIDENCE_ANCHOR_CROSSFOLDER
     assert [f.folder for f in group.frames] == ["107EOSR6"] * 3
     assert [f.number for f in group.frames] == [9997, 9998, 9999]
+
+
+def test_canon_metadata_read_degrades_without_exiftool(monkeypatch, capsys):
+    """Without ExifTool, frames still come back -- described from their
+    filenames alone -- and ExifTool is never actually invoked."""
+    monkeypatch.setattr(
+        stackcopy, "exiftool_info",
+        lambda: stackcopy.ExifToolInfo(
+            executable=None, version=None, version_tuple=None,
+            source=stackcopy.ExifToolSource.NONE,
+        ),
+    )
+
+    def _run_should_not_be_called(*args, **kwargs):
+        raise AssertionError(
+            "subprocess.run must not be called when ExifTool is unavailable"
+        )
+
+    monkeypatch.setattr(subprocess, "run", _run_should_not_be_called)
+
+    frames = stackcopy.read_canon_stack_metadata(
+        ["/card/108EOSR6/IMG_0001.CR3", "/card/108EOSR6/IMG_0002.JPG"]
+    )
+
+    # Files are still parsed from their names (folder/number/ext survive)...
+    assert len(frames) == 2
+    by_number = {f.number: f for f in frames}
+    assert by_number[1].folder == "108EOSR6"
+    assert by_number[1].ext == ".cr3"
+    assert by_number[2].ext == ".jpg"
+    # ...but every metadata-derived field is genuinely unknown, not merely
+    # unset by coincidence -- a broken degradation path that fabricated a
+    # value here (e.g. defaulting depth_composite to False) would fail this.
+    assert all(
+        f.depth_composite is None
+        and f.timestamp_text is None
+        and f.timestamp is None
+        and f.image_count is None
+        for f in frames
+    )
+    # Exactly one concise warning, naming the degraded file count.
+    output = capsys.readouterr().out
+    assert output.count("Warning:") == 1
+    assert "2 file" in output
+
+
+def test_canon_metadata_read_parses_batch(monkeypatch, capsys):
+    payload = (
+        '[{"SourceFile":"/card/108EOSR6/IMG_0002.JPG",'
+        '"SubSecDateTimeOriginal":"2026:07:31 10:44:02.03-04:00",'
+        '"FocusBracketingDepthComposite":1,'
+        '"FocusBracketingImageCount":25}]'
+    )
+    monkeypatch.setattr(
+        stackcopy, "exiftool_info",
+        lambda: stackcopy.ExifToolInfo(
+            executable="/usr/bin/exiftool", version="13.59",
+            version_tuple=(13, 59), source=stackcopy.ExifToolSource.PATH,
+        ),
+    )
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, payload, ""),
+    )
+    frames = stackcopy.read_canon_stack_metadata(
+        ["/card/108EOSR6/IMG_0002.JPG"]
+    )
+    assert frames[0].depth_composite is True
+    assert frames[0].image_count == 25
+    assert frames[0].timestamp_text == "2026:07:31 10:44:02.03-04:00"
+    # A fully-reported batch is not degraded, so no warning is printed.
+    assert capsys.readouterr().out == ""
 
 
 def test_composite_with_no_local_frames_respects_time_limit():
