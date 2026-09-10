@@ -8,11 +8,13 @@ one-file trial conversion, not a version number, is the authoritative gate.
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 
 DNG_CONVERTER_ENV = "STACKCOPY_DNG_CONVERTER"
 
@@ -156,3 +158,114 @@ def preflight(converter: str, sample_cr3: str) -> str | None:
         f"Adobe DNG Converter ({version_text}) could not convert "
         f"{os.path.basename(sample_cr3)}.{hint}"
     )
+
+
+CONVERT_TIMEOUT_PER_FILE_SECONDS = 120
+
+
+@dataclass(frozen=True)
+class ConversionResult:
+    dest_dir: str
+    converted: int = 0
+    skipped: int = 0
+    failed: int = 0
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.failed == 0
+
+
+def _expected_dng(dest_dir: str, source: str) -> str:
+    stem = os.path.splitext(os.path.basename(source))[0]
+    return os.path.join(dest_dir, f"{stem}.dng")
+
+
+def convert_group(
+    converter: str,
+    files: list[str],
+    dest_dir: str,
+    timeout: float | None = None,
+) -> ConversionResult:
+    """Convert one stack's frames into dest_dir.
+
+    Already-converted frames are skipped, so an interrupted import resumes.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    pending = [f for f in files if not os.path.exists(_expected_dng(dest_dir, f))]
+    skipped = len(files) - len(pending)
+    if not pending:
+        return ConversionResult(dest_dir, converted=0, skipped=skipped)
+
+    if timeout is None:
+        timeout = CONVERT_TIMEOUT_PER_FILE_SECONDS * len(pending)
+    try:
+        completed = subprocess.run(
+            convert_command(converter, dest_dir, pending),
+            check=False,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return ConversionResult(
+            dest_dir, skipped=skipped, failed=len(pending),
+            error=f"conversion timed out after {timeout:.0f}s",
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return ConversionResult(
+            dest_dir, skipped=skipped, failed=len(pending),
+            error=f"converter could not be run: {error}",
+        )
+
+    missing = [f for f in pending if not os.path.exists(_expected_dng(dest_dir, f))]
+    if missing:
+        detail = ", ".join(os.path.basename(f) for f in missing[:3])
+        if len(missing) > 3:
+            detail += f", and {len(missing) - 3} more"
+        return ConversionResult(
+            dest_dir,
+            converted=len(pending) - len(missing),
+            skipped=skipped,
+            failed=len(missing),
+            error=(
+                f"converter exited {completed.returncode} without producing "
+                f"DNG for {detail}"
+            ),
+        )
+    return ConversionResult(dest_dir, converted=len(pending), skipped=skipped)
+
+
+def convert_groups(
+    converter: str,
+    jobs_by_dest: list[tuple[str, list[str]]],
+    workers: int = 1,
+    on_progress=None,
+) -> list[ConversionResult]:
+    """Convert many stacks, parallel across folders.
+
+    Conversion is CPU-bound and single-threaded per file, and dominates the
+    wall-clock of an import, so folder-level parallelism is the main lever.
+    """
+    results: list[ConversionResult] = []
+    if workers <= 1:
+        for dest_dir, files in jobs_by_dest:
+            result = convert_group(converter, files, dest_dir)
+            results.append(result)
+            if on_progress:
+                on_progress(result)
+        return results
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(convert_group, converter, files, dest_dir): dest_dir
+            for dest_dir, files in jobs_by_dest
+        }
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            results.append(result)
+            if on_progress:
+                on_progress(result)
+    return results

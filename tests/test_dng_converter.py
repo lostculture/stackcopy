@@ -89,3 +89,54 @@ def test_preflight_fails_when_exit_zero_but_no_dng_produced(tmp_path):
     sample = tmp_path / "IMG_0001.CR3"
     sample.write_bytes(b"raw")
     assert dng_converter.preflight(stub, str(sample)) is not None
+
+
+def test_convert_group_reports_every_file_converted(tmp_path):
+    if sys.platform == "win32":
+        body = r'for %%f in (%*) do @if not "%%~xf"==".dng" echo d > "%~4\%%~nf.dng"'
+    else:
+        body = 'd="$4"; shift 4; mkdir -p "$d"; for f; do echo d > "$d/$(basename "${f%.*}").dng"; done'
+    stub = make_stub(tmp_path, body)
+    src = tmp_path / "src"
+    src.mkdir()
+    files = []
+    for n in range(1, 4):
+        f = src / f"IMG_{n:04d}.CR3"
+        f.write_bytes(b"raw")
+        files.append(str(f))
+    dest = tmp_path / "out"
+    result = dng_converter.convert_group(stub, files, str(dest))
+    assert result.converted == 3
+    assert result.failed == 0
+    assert result.error is None
+
+
+def test_convert_group_detects_missing_output(tmp_path):
+    """Converter exits 0 but silently produced nothing - still a failure."""
+    stub = make_stub(tmp_path, "exit 0")
+    src = tmp_path / "src"
+    src.mkdir()
+    f = src / "IMG_0001.CR3"
+    f.write_bytes(b"raw")
+    dest = tmp_path / "out"
+    result = dng_converter.convert_group(stub, [str(f)], str(dest))
+    assert result.failed == 1
+    assert result.error is not None
+
+
+def test_convert_group_resumes_completed_work(tmp_path):
+    stub = make_stub(tmp_path, "exit 1")  # would fail if it ran
+    src = tmp_path / "src"
+    src.mkdir()
+    dest = tmp_path / "out"
+    dest.mkdir()
+    files = []
+    for n in range(1, 3):
+        f = src / f"IMG_{n:04d}.CR3"
+        f.write_bytes(b"raw")
+        files.append(str(f))
+        (dest / f"IMG_{n:04d}.dng").write_bytes(b"already done")
+    result = dng_converter.convert_group(stub, files, str(dest))
+    assert result.skipped == 2
+    assert result.converted == 0
+    assert result.error is None
