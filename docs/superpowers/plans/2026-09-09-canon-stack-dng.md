@@ -1955,3 +1955,356 @@ git commit -m "docs(canon): document --canon-import and DNG requirements"
 **Type consistency.** `CanonFrame` fields (`folder`, `number`, `ext`, `name`, `timestamp_text`, `timestamp`, `depth_composite`, `image_count`) are used identically in Tasks 2–5 and 8. `CanonStackGroup.frames` is a tuple everywhere. `ConversionResult` fields match between Task 7's definition and Task 9's consumption (`.ok`, `.error`, `.dest_dir`). `convert_command` is defined in Task 6 and used in Task 7.
 
 **One deviation from the spec, recorded deliberately:** conversion lives in `dng_converter.py` rather than inside `canon_stacks.py`, keeping the grouping module pure. The preflight requirement in Task 6 is new since the spec was written, added after Adobe DNG Converter 13.0 was found to reject every file from this camera.
+
+---
+
+### Task 11: Helicon Focus rendering
+
+**Files:**
+- Create: `helicon_focus.py`
+- Modify: `stackcopy.py` (add `--render-helicon`, call after conversion)
+- Test: `tests/test_helicon_focus.py`
+
+**Interfaces:**
+- Consumes: `CanonPlannedStack` from Task 8, `run_canon_import` from Task 9.
+- Produces: `find_helicon() -> str | None`, `render_stack(helicon, frames, output_path, method=2, radius=8, smoothing=4, jpeg_quality=95, timeout=None) -> RenderResult`, `RenderResult(output_path, rendered, skipped, error)`, `HELICON_ENV = "STACKCOPY_HELICON"`.
+
+**Verified CLI contract** (Helicon Focus 8.3, measured — full-resolution 5992x3996 output, exit 0, 10 s for 3 frames):
+
+```
+HeliconFocus.exe -silent -i <filelist.txt> -noprogress \
+                 -mp:2 -rp:8 -sp:4 -save:<out.jpg> -j:95
+```
+
+- **`-i <filelist.txt>` is mandatory, not a convenience.** A stack folder holds N DNGs *plus the camera's composite JPG*. The documented `-silent <folder>` form processes every image in the folder, which would feed an 8-bit JPEG into the stack alongside the raws. The file list is the only safe way to drive Helicon against this layout.
+- **`-noprogress` is required for headless operation.** Plain `-silent` still shows a progress-bar window; without `-noprogress` a non-interactive run hangs (measured: 300 s timeout, no output produced).
+- `-mp:2` is Method C, chosen as the default for macro subjects. `-mp:0` and `-mp:1` are methods A and B.
+- Output is written beside the stack folder as `<stem> helicon.jpg`, distinguishing the render from the camera's own composite inside the folder.
+- Progress arrives on stdout as a percentage stream ending in `Processing complete.`. Decide success by **exit code plus the output file existing**, never by parsing that stream.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/test_helicon_focus.py
+import stat
+import sys
+from pathlib import Path
+
+import pytest
+
+import helicon_focus
+
+
+def make_stub(tmp_path: Path, body: str, name: str = "helicon") -> str:
+    if sys.platform == "win32":
+        path = tmp_path / f"{name}.bat"
+        path.write_text(f"@echo off\n{body}\n", encoding="utf-8")
+    else:
+        path = tmp_path / name
+        path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return str(path)
+
+
+def test_filelist_contains_only_the_named_frames(tmp_path):
+    frames = [str(tmp_path / f"IMG_{n:04d}.dng") for n in (1, 2, 3)]
+    listing = helicon_focus.write_file_list(frames, str(tmp_path))
+    lines = Path(listing).read_text(encoding="utf-8").splitlines()
+    assert lines == frames
+
+
+def test_command_uses_filelist_and_noprogress(tmp_path):
+    command = helicon_focus.render_command(
+        "helicon.exe", "list.txt", str(tmp_path / "out.jpg"),
+        method=2, radius=8, smoothing=4, jpeg_quality=95,
+    )
+    assert "-silent" in command
+    assert "-noprogress" in command
+    assert "-i" in command
+    assert "-mp:2" in command
+    assert any(a.startswith("-save:") for a in command)
+    # The stack folder must never be passed as a positional path, or Helicon
+    # would pull the camera's composite JPG into the stack.
+    positionals = [a for a in command[1:] if not a.startswith("-")]
+    assert str(tmp_path) not in positionals
+
+
+def test_render_reports_failure_when_no_output(tmp_path):
+    stub = make_stub(tmp_path, "exit 0")  # exits clean, writes nothing
+    result = helicon_focus.render_stack(
+        stub, [str(tmp_path / "a.dng")], str(tmp_path / "out.jpg")
+    )
+    assert result.rendered is False
+    assert result.error is not None
+
+
+def test_render_succeeds_when_output_appears(tmp_path):
+    out = tmp_path / "out.jpg"
+    stub = make_stub(tmp_path, f'echo img > "{out}"')
+    result = helicon_focus.render_stack(
+        stub, [str(tmp_path / "a.dng")], str(out)
+    )
+    assert result.rendered is True
+    assert result.error is None
+
+
+def test_existing_output_is_not_rerendered(tmp_path):
+    out = tmp_path / "out.jpg"
+    out.write_bytes(b"already rendered")
+    stub = make_stub(tmp_path, "exit 1")  # would fail if it were invoked
+    result = helicon_focus.render_stack(
+        stub, [str(tmp_path / "a.dng")], str(out)
+    )
+    assert result.skipped is True
+    assert result.error is None
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `python -m pytest tests/test_helicon_focus.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'helicon_focus'`
+
+- [ ] **Step 3: Write minimal implementation**
+
+```python
+# helicon_focus.py
+"""Drive Helicon Focus from the command line to render stacks.
+
+Verified against Helicon Focus 8.3.  Two details are load-bearing:
+``-noprogress`` (plain ``-silent`` still shows a progress window, which hangs
+a non-interactive run) and ``-i <filelist>`` (a stack folder also holds the
+camera's composite JPG, which must never enter the stack).
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+
+HELICON_ENV = "STACKCOPY_HELICON"
+
+METHOD_A, METHOD_B, METHOD_C = 0, 1, 2
+DEFAULT_METHOD = METHOD_C
+DEFAULT_RADIUS = 8
+DEFAULT_SMOOTHING = 4
+DEFAULT_JPEG_QUALITY = 95
+RENDER_TIMEOUT_PER_FRAME_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class RenderResult:
+    output_path: str
+    rendered: bool = False
+    skipped: bool = False
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+def _candidate_paths() -> list[str]:
+    if sys.platform == "win32":
+        return [
+            r"C:\Program Files\Helicon Software\Helicon Focus 8\HeliconFocus.exe",
+            r"C:\Program Files\Helicon Software\Helicon Focus 7\HeliconFocus.exe",
+        ]
+    if sys.platform == "darwin":
+        return ["/Applications/HeliconFocus.app/Contents/MacOS/HeliconFocus"]
+    return []
+
+
+def find_helicon() -> str | None:
+    override = (os.environ.get(HELICON_ENV) or "").strip()
+    if override:
+        return override if os.path.isfile(override) else None
+    for candidate in _candidate_paths():
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def write_file_list(frames: list[str], directory: str) -> str:
+    """One absolute path per line, as -i expects."""
+    handle, path = tempfile.mkstemp(
+        prefix="stackcopy-helicon-", suffix=".txt", dir=directory
+    )
+    with os.fdopen(handle, "w", encoding="utf-8") as listing:
+        for frame in frames:
+            listing.write(f"{frame}\n")
+    return path
+
+
+def render_command(
+    helicon: str,
+    file_list: str,
+    output_path: str,
+    method: int = DEFAULT_METHOD,
+    radius: int = DEFAULT_RADIUS,
+    smoothing: int = DEFAULT_SMOOTHING,
+    jpeg_quality: int = DEFAULT_JPEG_QUALITY,
+) -> list[str]:
+    return [
+        helicon,
+        "-silent",
+        "-i", file_list,
+        "-noprogress",
+        f"-mp:{method}",
+        f"-rp:{radius}",
+        f"-sp:{smoothing}",
+        f"-save:{output_path}",
+        f"-j:{jpeg_quality}",
+    ]
+
+
+def render_stack(
+    helicon: str,
+    frames: list[str],
+    output_path: str,
+    method: int = DEFAULT_METHOD,
+    radius: int = DEFAULT_RADIUS,
+    smoothing: int = DEFAULT_SMOOTHING,
+    jpeg_quality: int = DEFAULT_JPEG_QUALITY,
+    timeout: float | None = None,
+) -> RenderResult:
+    """Render one stack.  An existing output is left alone so runs resume."""
+    if os.path.exists(output_path):
+        return RenderResult(output_path, rendered=False, skipped=True)
+    if not frames:
+        return RenderResult(output_path, error="no frames to render")
+
+    directory = os.path.dirname(output_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    listing = write_file_list(frames, directory)
+    if timeout is None:
+        timeout = RENDER_TIMEOUT_PER_FRAME_SECONDS * len(frames)
+    try:
+        completed = subprocess.run(
+            render_command(
+                helicon, listing, output_path,
+                method, radius, smoothing, jpeg_quality,
+            ),
+            check=False,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return RenderResult(
+            output_path, error=f"Helicon timed out after {timeout:.0f}s"
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return RenderResult(
+            output_path, error=f"Helicon could not be run: {error}"
+        )
+    finally:
+        try:
+            os.unlink(listing)
+        except OSError:
+            pass
+
+    if not os.path.exists(output_path):
+        return RenderResult(
+            output_path,
+            error=(
+                f"Helicon exited {completed.returncode} without writing "
+                f"{os.path.basename(output_path)}"
+            ),
+        )
+    return RenderResult(output_path, rendered=True)
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `python -m pytest tests/test_helicon_focus.py -v`
+Expected: PASS, 5 tests.
+
+- [ ] **Step 5: Wire the flag into stackcopy.py**
+
+Add alongside the other Canon options:
+
+```python
+    parser.add_argument(
+        "--render-helicon",
+        action="store_true",
+        help=(
+            "After importing, render each stack with Helicon Focus to "
+            "'<stack> helicon.jpg' beside its folder."
+        ),
+    )
+    parser.add_argument(
+        "--helicon-method",
+        type=int,
+        choices=(0, 1, 2),
+        default=2,
+        metavar="N",
+        help="Helicon rendering method: 0=A, 1=B, 2=C (default: 2).",
+    )
+```
+
+Validate them like the other Canon-only flags (error unless `--canon-import`), then call at the end of `run_canon_import`, after conversion:
+
+```python
+    if args.render_helicon and not args.dry_run:
+        helicon = helicon_focus.find_helicon()
+        if helicon is None:
+            print(
+                "Helicon Focus was not found. Install it or set "
+                f"{helicon_focus.HELICON_ENV}."
+            )
+            return 1
+        for stack in plan.stacks:
+            if converter is not None:
+                frames = sorted(
+                    os.path.join(stack.dest_dir, name)
+                    for name in os.listdir(stack.dest_dir)
+                    if name.lower().endswith(".dng")
+                )
+            else:
+                frames = [
+                    os.path.join(stack.dest_dir, os.path.basename(source))
+                    for source in stack.frame_sources
+                ]
+            output = os.path.join(
+                os.path.dirname(stack.dest_dir),
+                f"{os.path.basename(stack.dest_dir)} helicon.jpg",
+            )
+            result = helicon_focus.render_stack(
+                helicon, frames, output, method=args.helicon_method
+            )
+            if result.error:
+                failures += 1
+                print(
+                    f"  Helicon failed: {display_path(output)}: {result.error}"
+                )
+            elif args.verbose and result.rendered:
+                print(f"  Rendered {display_path(output)}")
+```
+
+- [ ] **Step 6: Run the full suite**
+
+Run: `python -m pytest tests/ -v`
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add helicon_focus.py stackcopy.py tests/test_helicon_focus.py
+git commit -m "feat(helicon): render imported stacks via Helicon Focus CLI"
+```
+
+---
+
+## Measured environment notes
+
+Recorded so later tuning starts from evidence rather than assumption.
+
+- **Adobe DNG Converter 18.6** converts EOS R6 Mark II CR3 in about 3 s/file, exit 0. Version 13.0 rejected every file in about 1 s, because raw support is per-camera-model and that build predates the body by two years.
+- **Adobe parallelises internally within one invocation:** one file took 3 s, three files also took 3 s. Folder-level `--dng-jobs` therefore matters far less than assumed when the plan was written. Measure before raising it; extra workers may simply contend for the same cores.
+- **Adobe prints `*** Error: cr_sensei_model_manager ...` to stderr on fully successful conversions.** These are Sensei/WinML denoise-model warnings unrelated to raw decoding. Never treat stderr content as a failure signal; use exit code plus output-file existence.
+- **Helicon Focus 8.3** rendered three DNG frames in 10 s at full resolution (5992x3996, 23.9 MP), confirming a registered licence with no 4 MP trial cap.
