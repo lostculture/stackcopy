@@ -142,6 +142,138 @@ def test_convert_group_resumes_completed_work(tmp_path):
     assert result.error is None
 
 
+def _writes_then_fails_stub(tmp_path, name="half_written_stub"):
+    """Produces DNG output and then reports failure, as a killed run does."""
+    if sys.platform == "win32":
+        body = (
+            r'for %%f in (%*) do @if not "%%~xf"==".dng" '
+            r'echo partial > "%~4\%%~nf.dng"'
+            "\nexit 1"
+        )
+    else:
+        body = (
+            'd="$4"; shift 4; mkdir -p "$d"; '
+            'for f; do echo partial > "$d/$(basename "${f%.*}").dng"; done; '
+            "exit 1"
+        )
+    return make_stub(tmp_path, body, name)
+
+
+def test_convert_group_requires_exit_zero_even_when_files_exist(tmp_path):
+    """Fix round 2, item 4: one module, one success rule.
+
+    _convert_group used to declare a group converted purely because the
+    expected files existed, ignoring the exit status -- while preflight()
+    and helicon_focus.render_stack both required exit 0 AND a file. The real
+    Adobe DNG Converter 18.6 was measured on this machine converting a real
+    EOS R6 Mark II CR3: it exits 0 on success, so requiring it is safe, and
+    a non-zero exit alongside output means the output is suspect.
+    """
+    stub = _writes_then_fails_stub(tmp_path)
+    src = tmp_path / "src"
+    src.mkdir()
+    f = src / "IMG_0001.CR3"
+    f.write_bytes(b"raw")
+    dest = tmp_path / "out"
+
+    result = dng_converter.convert_group(stub, [str(f)], str(dest))
+
+    assert not result.ok
+    assert result.failed == 1
+    assert result.converted == 0
+    # The message must say output WAS produced, so the user can judge
+    # rather than assume the converter never ran.
+    assert "did produce DNG output" in result.error
+    assert "discarded" in result.error
+    # Suspect output must not be left at the real path, where every later
+    # resume would skip it as finished.
+    assert not (dest / "IMG_0001.dng").exists()
+
+
+def test_a_half_written_dng_is_not_mistaken_for_finished_work(tmp_path):
+    """Fix round 2, item 5: resume must not trust a file that merely exists.
+
+    A converter killed mid-write (Ctrl-C in hour two of a 65 GB import) used
+    to leave a truncated DNG at the frame's real path. Every later run
+    skipped it as already converted, and Helicon was then handed the
+    truncated file. Converting into a staging directory and publishing with
+    os.replace means the only file that ever reaches the real path is a
+    complete one -- so the second run below must actually convert, not skip.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    f = src / "IMG_0001.CR3"
+    f.write_bytes(b"raw")
+    dest = tmp_path / "out"
+
+    killed = dng_converter.convert_group(
+        _writes_then_fails_stub(tmp_path), [str(f)], str(dest)
+    )
+    assert not killed.ok
+    assert list(dest.glob("*.dng")) == [], "nothing partial may be published"
+    # Nor may staging debris be left behind for the next run to trip over.
+    assert list(dest.glob(f"{dng_converter.STAGING_PREFIX}*")) == []
+
+    resumed = dng_converter.convert_group(
+        _success_stub(tmp_path), [str(f)], str(dest)
+    )
+    assert resumed.ok
+    assert resumed.converted == 1
+    assert resumed.skipped == 0, (
+        "the killed run's leftovers were mistaken for finished work"
+    )
+    assert (dest / "IMG_0001.dng").read_text().strip() != "partial"
+
+
+def test_converter_writes_to_staging_and_os_replace_publishes(tmp_path, monkeypatch):
+    """The publish is a rename from staging, not a write to the final path.
+
+    Asserted structurally rather than by racing a real process: the
+    converter is never handed the destination folder as its -d argument,
+    and the file that ends up there arrives via os.replace.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    f = src / "IMG_0001.CR3"
+    f.write_bytes(b"raw")
+    dest = tmp_path / "out"
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["dest_arg"] = cmd[4]  # [converter, -c, -p1, -d, <dir>, files...]
+        Path(cmd[4], "IMG_0001.dng").write_bytes(b"complete")
+        seen["published_during_run"] = (dest / "IMG_0001.dng").exists()
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(dng_converter.subprocess, "run", fake_run)
+
+    replaced = []
+    real_replace = os.replace
+
+    def spy_replace(a, b):
+        replaced.append((a, b))
+        return real_replace(a, b)
+
+    monkeypatch.setattr(dng_converter.os, "replace", spy_replace)
+
+    result = dng_converter.convert_group("/fake/converter", [str(f)], str(dest))
+
+    assert result.ok and result.converted == 1
+    assert seen["dest_arg"] != str(dest), (
+        "the converter must never write straight to the frame's final folder"
+    )
+    assert os.path.dirname(seen["dest_arg"]) == str(dest), (
+        "staging must be a child of dest_dir so os.replace stays atomic"
+    )
+    assert seen["published_during_run"] is False
+    assert replaced == [
+        (os.path.join(seen["dest_arg"], "IMG_0001.dng"),
+         str(dest / "IMG_0001.dng"))
+    ]
+    assert (dest / "IMG_0001.dng").read_bytes() == b"complete"
+
+
 def _success_stub(tmp_path, name="success_stub"):
     """A converter stub that writes a .dng for every input file it's given."""
     if sys.platform == "win32":

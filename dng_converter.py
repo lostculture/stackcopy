@@ -4,6 +4,13 @@ Raw support is per-camera-model, not per-format: a converter does not
 "support CR3", it carries a profile for each body.  A converter older than
 the camera rejects its files instantly at header parse.  That is why a
 one-file trial conversion, not a version number, is the authoritative gate.
+
+Success here is decided by two signals only: an exit status of 0 *and* the
+expected file on disk.  Captured stdout/stderr is never part of that
+decision -- the real Adobe binary prints Sensei/WinML error text to stderr
+during fully successful conversions, so any output-parsing in the decision
+path would misreport total success as total failure.  Captured output is
+kept for diagnostics alone.
 """
 
 from __future__ import annotations
@@ -173,7 +180,11 @@ class ConversionResult:
 
     @property
     def ok(self) -> bool:
-        return self.error is None and self.failed == 0
+        # Deliberately the same rule as helicon_focus.RenderResult.ok: one
+        # error field, one success test, so callers can treat both external
+        # tools identically.  Every failure path below sets ``error``
+        # whenever ``failed`` is non-zero, so the two can never disagree.
+        return self.error is None
 
 
 def _expected_dng(dest_dir: str, source: str) -> str:
@@ -227,13 +238,53 @@ def convert_group(
         )
 
 
+STAGING_PREFIX = ".stackcopy-dng-"
+
+
+def _clear_stale_staging(dest_dir: str) -> None:
+    """Remove staging directories abandoned by a killed earlier run.
+
+    They are only ever transient, so anything found at the start of a group
+    is debris from a run that did not get to publish its work.
+    """
+    try:
+        names = os.listdir(dest_dir)
+    except OSError:
+        return
+    for name in names:
+        if name.startswith(STAGING_PREFIX):
+            shutil.rmtree(os.path.join(dest_dir, name), ignore_errors=True)
+
+
+def _names_of(files: list[str], limit: int = 3) -> str:
+    detail = ", ".join(os.path.basename(f) for f in files[:limit])
+    if len(files) > limit:
+        detail += f", and {len(files) - limit} more"
+    return detail
+
+
 def _convert_group(
     converter: str,
     files: list[str],
     dest_dir: str,
     timeout: float | None,
 ) -> ConversionResult:
+    """Convert ``pending`` into a staging directory, then publish atomically.
+
+    The converter never writes to a frame's final path.  Each finished DNG
+    is moved into place with ``os.replace`` once the converter has both
+    exited 0 and left the file behind, so a file at its final path is always
+    a complete one.  This is what makes the resume skip below trustworthy: a
+    run killed mid-write (Ctrl-C in hour two of a 65 GB import) leaves a
+    truncated file inside the staging directory, which is discarded, rather
+    than a truncated file at the real path that every later run would skip
+    as "already converted" and then hand to Helicon.
+
+    The staging directory is a child of ``dest_dir`` so the publish is a
+    same-filesystem rename, which os.replace guarantees to be atomic.
+    """
     os.makedirs(dest_dir, exist_ok=True)
+    _clear_stale_staging(dest_dir)
     pending = [f for f in files if not os.path.exists(_expected_dng(dest_dir, f))]
     skipped = len(files) - len(pending)
     if not pending:
@@ -241,45 +292,73 @@ def _convert_group(
 
     if timeout is None:
         timeout = CONVERT_TIMEOUT_PER_FILE_SECONDS * len(pending)
-    try:
-        completed = subprocess.run(
-            convert_command(converter, dest_dir, pending),
-            check=False,
-            capture_output=True,
-            stdin=subprocess.DEVNULL,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as error:
-        tail = _tail(error.stdout) or _tail(error.stderr)
-        return ConversionResult(
-            dest_dir, skipped=skipped, failed=len(pending),
-            error=f"conversion timed out after {timeout:.0f}s.{tail}",
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        return ConversionResult(
-            dest_dir, skipped=skipped, failed=len(pending),
-            error=f"converter could not be run: {error}",
-        )
 
-    missing = [f for f in pending if not os.path.exists(_expected_dng(dest_dir, f))]
-    if missing:
-        detail = ", ".join(os.path.basename(f) for f in missing[:3])
-        if len(missing) > 3:
-            detail += f", and {len(missing) - 3} more"
+    staging = tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=dest_dir)
+    try:
+        try:
+            completed = subprocess.run(
+                convert_command(converter, staging, pending),
+                check=False,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            tail = _tail(error.stdout) or _tail(error.stderr)
+            return ConversionResult(
+                dest_dir, skipped=skipped, failed=len(pending),
+                error=f"conversion timed out after {timeout:.0f}s.{tail}",
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            return ConversionResult(
+                dest_dir, skipped=skipped, failed=len(pending),
+                error=f"converter could not be run: {error}",
+            )
+
+        produced = [f for f in pending if os.path.exists(_expected_dng(staging, f))]
         tail = _tail(completed.stderr) or _tail(completed.stdout)
-        return ConversionResult(
-            dest_dir,
-            converted=len(pending) - len(missing),
-            skipped=skipped,
-            failed=len(missing),
-            error=(
-                f"converter exited {completed.returncode} without producing "
-                f"DNG for {detail}.{tail}"
-            ),
-        )
-    return ConversionResult(dest_dir, converted=len(pending), skipped=skipped)
+
+        # Exit status and files on disk must agree, exactly as preflight()
+        # and helicon_focus.render_stack require.  Output that exists
+        # alongside a non-zero exit is not published: it may be a partial
+        # write, and publishing it would poison every later resume.
+        if completed.returncode != 0:
+            produced_note = (
+                f" It did produce DNG output for {len(produced)} of "
+                f"{len(pending)} frame(s), but the converter reported "
+                "failure, so that output was discarded rather than kept: it "
+                "may be incomplete."
+                if produced
+                else ""
+            )
+            return ConversionResult(
+                dest_dir, skipped=skipped, failed=len(pending),
+                error=(
+                    f"converter exited {completed.returncode} converting "
+                    f"{_names_of(pending)}.{produced_note}{tail}"
+                ),
+            )
+
+        for source in produced:
+            os.replace(_expected_dng(staging, source), _expected_dng(dest_dir, source))
+
+        missing = [f for f in pending if f not in set(produced)]
+        if missing:
+            return ConversionResult(
+                dest_dir,
+                converted=len(produced),
+                skipped=skipped,
+                failed=len(missing),
+                error=(
+                    f"converter exited {completed.returncode} without producing "
+                    f"DNG for {_names_of(missing)}.{tail}"
+                ),
+            )
+        return ConversionResult(dest_dir, converted=len(pending), skipped=skipped)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def convert_groups(
