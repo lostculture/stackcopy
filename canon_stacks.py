@@ -9,6 +9,7 @@ fixture rather than a camera card.
 from __future__ import annotations
 
 import re
+import statistics
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -130,8 +131,12 @@ def records_from_exiftool_json(payload) -> list[CanonFrame]:
 
 
 CONFIDENCE_ANCHOR = "anchor"
+CONFIDENCE_CADENCE = "cadence"
 
 MAX_CANON_STACK_FRAMES = 999  # Canon focus bracketing allows up to 999.
+
+CADENCE_TAIL_GAPS = 5
+CADENCE_FACTOR = 4.0
 
 
 @dataclass(frozen=True)
@@ -188,6 +193,36 @@ def _anchor_cut(run: list[CanonFrame], jpg: CanonFrame) -> list[CanonFrame] | No
     return None
 
 
+def _cadence_cut(
+    run: list[CanonFrame],
+    tail: int = CADENCE_TAIL_GAPS,
+    factor: float = CADENCE_FACTOR,
+) -> list[CanonFrame]:
+    """Walk back from the newest frame while the interval stays consistent.
+
+    The reference interval comes from the *tail* of the run - the frames
+    nearest the composite, which are certainly part of the stack.  Using the
+    whole run's median would be contaminated by the very ordinary shots this
+    cut exists to exclude.
+    """
+    timed = [f for f in run if f.timestamp is not None]
+    if len(timed) < 2:
+        return list(run)
+    gaps = [
+        timed[i + 1].timestamp - timed[i].timestamp for i in range(len(timed) - 1)
+    ]
+    reference = statistics.median(gaps[-tail:] if len(gaps) > tail else gaps)
+    if reference <= 0:
+        return list(timed)
+    tolerance = reference * factor
+    cut = 0
+    for position in range(len(gaps) - 1, -1, -1):
+        if gaps[position] > tolerance:
+            cut = position + 1
+            break
+    return timed[cut:]
+
+
 def _count_note(jpg: CanonFrame, frames: list[CanonFrame]) -> tuple[str, ...]:
     """FocusBracketingImageCount is the camera setting, never a boundary."""
     if jpg.image_count and jpg.image_count != len(frames):
@@ -217,14 +252,23 @@ def group_canon_stacks(records: list[CanonFrame]) -> list[CanonStackGroup]:
         if not run:
             continue
         frames = _anchor_cut(run, jpg)
+        confidence = CONFIDENCE_ANCHOR
+        notes: tuple[str, ...] = ()
         if frames is None:
+            frames = _cadence_cut(run)
+            confidence = CONFIDENCE_CADENCE
+            notes = (
+                "no frame matched the composite timestamp; "
+                "grouped by cadence",
+            )
+        if not frames:
             continue
         groups.append(
             CanonStackGroup(
                 output_jpg=jpg,
                 frames=tuple(frames),
-                confidence=CONFIDENCE_ANCHOR,
-                notes=_count_note(jpg, frames),
+                confidence=confidence,
+                notes=notes + _count_note(jpg, frames),
             )
         )
     return groups
