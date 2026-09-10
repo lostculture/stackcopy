@@ -103,8 +103,15 @@ def test_non_composite_jpg_is_not_grouped():
 
 
 def test_jpg_with_matching_cr3_is_not_grouped():
-    """A RAW+JPG pair shares its number and is an ordinary shot."""
+    """A RAW+JPG pair shares its number and is an ordinary shot.
+
+    IMG_0004.CR3 shares the composite's timestamp, so without the
+    same-number guard the anchor would incorrectly match it and produce a
+    (wrong) one-frame group.  This gives the guard something real to block.
+    """
     frames = [
+        canon_stacks.CanonFrame("108EOSR6", 4, ".cr3", "IMG_0004.CR3",
+                                timestamp=100.0, depth_composite=True),
         canon_stacks.CanonFrame("108EOSR6", 5, ".cr3", "IMG_0005.CR3",
                                 timestamp=100.0, depth_composite=True),
         canon_stacks.CanonFrame("108EOSR6", 5, ".jpg", "IMG_0005.JPG",
