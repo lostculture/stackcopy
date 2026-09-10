@@ -170,6 +170,13 @@ def test_unresolved_composite_is_named_and_not_double_counted_into_singles():
 
 
 def test_dry_run_writes_nothing_and_reports_groups(plan, tmp_path, monkeypatch, capsys):
+    # The source dir must actually exist: run_canon_import now fails fast on
+    # a nonexistent source path (fix round 1, item 1), and this test's intent
+    # is "dry run writes nothing" -- not "a nonexistent path is tolerated" --
+    # so a valid, merely-empty directory is the correct setup here. What's
+    # actually scanned from it is irrelevant since build_canon_import_plan
+    # itself is mocked below.
+    (tmp_path / "src").mkdir()
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
@@ -185,6 +192,43 @@ def test_dry_run_writes_nothing_and_reports_groups(plan, tmp_path, monkeypatch, 
     assert exit_code == 0
     assert "101" in output
     assert not (tmp_path / "dst").exists()
+
+
+def test_nonexistent_source_path_exits_nonzero_and_names_the_path(tmp_path, capsys):
+    """Fix round 1, item 1: a typo'd source folder must not exit 0.
+
+    Before this fix, a mistyped path (e.g. missing the trailing digit of a
+    camera folder name) and a correctly-typed but genuinely empty folder
+    were indistinguishable: both printed "No Canon files found" and
+    returned 0, so a script checking exit codes -- or a user glancing at the
+    output -- could believe a bad path had run cleanly and simply found
+    nothing.
+    """
+    missing = tmp_path / "src" / "108EOSR6"  # never created
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(missing), str(tmp_path / "dst")]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+    output = capsys.readouterr().out
+    assert exit_code != 0
+    assert "108EOSR6" in output, "the message must name the offending path"
+    assert not (tmp_path / "dst").exists()
+
+
+def test_existing_but_empty_source_directory_still_exits_zero(tmp_path, capsys):
+    """The other half of the item-1 distinction: a real, empty folder is a
+    real (non-error) answer, not a typo -- it must keep exiting 0 with a
+    "no Canon files" message, unlike a path that does not exist at all.
+    """
+    empty = tmp_path / "src" / "108EOSR6"
+    empty.mkdir(parents=True)
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(empty), str(tmp_path / "dst")]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "No Canon files found" in output
 
 
 def test_no_dng_skips_the_converter_entirely(tmp_path, monkeypatch):
@@ -282,6 +326,56 @@ def test_loose_cr3s_are_actually_copied_not_merely_planned(tmp_path, monkeypatch
         "not merely exist"
     )
     assert single_dest.read_bytes() == b"loose-frame-bytes"
+
+
+def test_conversion_requested_but_no_sample_frame_announces_raw_fallback(
+    tmp_path, monkeypatch, capsys
+):
+    """Fix round 1, item 2: falling back to a raw copy must never be silent.
+
+    The real grouping algorithm never produces a stack with zero frames (a
+    zero-frame composite becomes `unresolved`, not a stack -- see
+    build_canon_import_plan's docstring), but the plan is a public seam
+    another caller can substitute (as this test, and several others in this
+    file, already do), and this guards that seam: if conversion was
+    requested (no --no-dng) and there is real stack work, yet nothing
+    exists anywhere to preflight the converter against, the fallback to
+    copying raw files must be said out loud rather than look identical to
+    --no-dng with no explanation.
+    """
+    stack_dir = tmp_path / "dst" / "2026-01-01" / "IMG_0001"
+    fake_plan = stackcopy.CanonImportPlan(
+        stacks=(
+            stackcopy.CanonPlannedStack(
+                dest_dir=str(stack_dir),
+                jpg_src=str(tmp_path / "IMG_0001.JPG"),
+                jpg_dest=str(stack_dir / "IMG_0001.JPG"),
+                frame_sources=(),
+            ),
+        ),
+        singles=(),
+        single_sources=(),
+        unresolved=(),
+    )
+    monkeypatch.setattr(
+        stackcopy, "build_canon_import_plan", lambda *a, **k: fake_plan
+    )
+    called = []
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "find_dng_converter",
+        lambda: called.append("looked") or "/fake/converter",
+    )
+
+    (tmp_path / "src").mkdir()
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"), "--dry"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert called == [], "nothing to preflight against, so never even looked"
+    assert "copying raw CR3 frames instead" in output
 
 
 def test_no_dng_execution_copies_composite_frame_and_single(tmp_path, monkeypatch):

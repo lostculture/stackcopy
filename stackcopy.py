@@ -3236,6 +3236,18 @@ def run_canon_import(args) -> int:
         args.singles_dir or os.path.join(os.path.dirname(dest_dir), "Single Images")
     )
 
+    # Narrow, not the old broad pre-flight: a source path that does not
+    # exist at all (a typo'd camera folder, most often) must fail loudly
+    # rather than exit 0 looking identical to a real, merely-empty folder.
+    # A path that exists but genuinely has nothing in it is a real answer
+    # to a well-formed question and keeps reporting "0 stacks" with exit 0.
+    if not os.path.isdir(source_dir):
+        print(
+            f"Error: source directory '{display_path(source_dir)}' does not "
+            "exist or is not a directory."
+        )
+        return 1
+
     source_root, target_folders = _canon_scan_targets(source_dir)
 
     paths: list[str] = []
@@ -3308,6 +3320,15 @@ def run_canon_import(args) -> int:
             if problem:
                 print(problem)
                 return 1
+        elif plan.stacks:
+            # Conversion was requested and there is real stack work, but no
+            # frame exists anywhere to preflight the converter against.
+            # Falling back to a raw copy is the same *code path* as
+            # --no-dng, so it must not also be silent about it.
+            print(
+                "No frames were available to preflight the DNG converter "
+                "against; copying raw CR3 frames instead of converting."
+            )
 
     if args.dry_run:
         print("Dry run: nothing was copied or converted.")
