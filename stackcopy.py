@@ -2954,23 +2954,37 @@ def read_canon_stack_metadata(paths: list[str]) -> list["canon_stacks.CanonFrame
 
 @dataclass(frozen=True)
 class CanonPlannedStack:
-    """One focus stack, mapped onto a single destination folder."""
+    """One focus stack, mapped onto a single destination folder.
+
+    ``notes`` carries canon_stacks' own notes for this group verbatim (a
+    cadence-only match, a spanned-folder borrow, a frame-count mismatch --
+    never a reason to drop the stack, only to flag it for the user).
+    """
 
     dest_dir: str
     jpg_src: str
     jpg_dest: str
     frame_sources: tuple[str, ...]
+    notes: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class CanonImportPlan:
     """The full mapping of a --canon-import scan onto destination paths.
+
+    Keyword-only construction: field order here has already drifted once as
+    fields were added, and nothing constructs this positionally, so there is
+    no reason to leave that landmine armed.
 
     ``singles`` and ``single_sources`` are parallel tuples: ``singles[i]``
     is the planned destination for the loose CR3 whose source path is
     ``single_sources[i]``. Kept as two tuples of plain strings, rather than
     a tuple of pairs, so callers that only need one side are not forced to
     unpack -- most callers only care about the destination.
+
+    ``unresolved`` holds composites *inside a target folder* for which
+    canon_stacks could find no frames at all -- not merely a low-confidence
+    match, which still becomes a real stack (see build_canon_import_plan).
     """
 
     stacks: tuple[CanonPlannedStack, ...]
@@ -3001,6 +3015,7 @@ def build_canon_import_plan(
     dest_root: str,
     singles_root: str,
     source_root: str = "",
+    target_folders: set[str] | None = None,
 ) -> CanonImportPlan:
     """Map grouped Canon stacks onto destination folders.
 
@@ -3012,14 +3027,31 @@ def build_canon_import_plan(
     DateTimeOriginal rather than filesystem mtime, because detection already
     reads DateTimeOriginal and mtime does not survive a copy.
 
-    A cadence-only group (canon_stacks.CONFIDENCE_CADENCE: no frame's
-    timestamp matched the composite's, so the boundary was guessed from
-    shot spacing) is too weak to auto-create an import folder for, so it is
-    reported via ``unresolved`` instead of ``stacks``. Its frames are still
-    claimed, though: they are part of *some* burst, not stray loose shots,
-    so leaving them unclaimed would misfile them as singles.
+    ``target_folders`` names the camera folders actually being imported (for
+    example ``{"108EOSR6"}``). ``None`` means every folder present in
+    ``records`` is a target -- this preserves prior behaviour for a caller
+    that passes everything it scanned.
+
+    A record from a folder that is *not* a target is borrowable context
+    only: its frames may complete a target stack that spans the rollover
+    (this is exactly how IMG_0014 gets 12 frames from 107EOSR6), but such a
+    folder never produces a planned stack of its own, and its CR3s never
+    become singles -- they were never part of what the user asked to import.
+
+    Every composite inside a target folder produces a planned stack,
+    regardless of how confidently canon_stacks matched its frames: a
+    genuinely ambiguous but in-scope stack (clock skew, overlapping bursts, a
+    real EXIF gap) must never be silently dropped from the plan just because
+    it happens to share a confidence tier with a truncated, out-of-scope
+    one. Confidence-related caveats travel along as
+    ``CanonPlannedStack.notes`` instead of gating inclusion.
+    ``unresolved`` is reserved for the narrower case of a target-folder
+    composite for which canon_stacks could find no frames at all.
     """
     import canon_stacks
+
+    def is_target(folder: str) -> bool:
+        return target_folders is None or folder in target_folders
 
     groups = canon_stacks.group_canon_stacks(records)
 
@@ -3027,15 +3059,19 @@ def build_canon_import_plan(
         return os.path.join(source_root, frame.folder, frame.name)
 
     stacks: list[CanonPlannedStack] = []
-    unresolved: list["canon_stacks.CanonStackGroup"] = []
     claimed_sources: set[str] = set()
+    grouped_keys: set[tuple[str, int]] = set()
     for group in groups:
+        grouped_keys.add((group.output_jpg.folder, group.output_jpg.number))
         frame_sources = tuple(source_path(frame) for frame in group.frames)
         jpg_src = source_path(group.output_jpg)
+        # Claimed regardless of whether this group's own composite is in
+        # scope: a context-folder group's frames may still be the ones a
+        # target stack borrowed, and even when they are not, they must not
+        # fall through to the singles pass below (see the docstring).
         claimed_sources.update(frame_sources)
         claimed_sources.add(jpg_src)
-        if group.confidence == canon_stacks.CONFIDENCE_CADENCE:
-            unresolved.append(group)
+        if not is_target(group.output_jpg.folder):
             continue
         stem = os.path.splitext(group.output_jpg.name)[0]
         dest_dir = os.path.join(dest_root, _canon_group_date(group), stem)
@@ -3045,13 +3081,42 @@ def build_canon_import_plan(
                 jpg_src=jpg_src,
                 jpg_dest=os.path.join(dest_dir, group.output_jpg.name),
                 frame_sources=frame_sources,
+                notes=group.notes,
+            )
+        )
+
+    # A target-folder composite for which canon_stacks could find no frames
+    # at all never appears in `groups` at all -- it is identified here the
+    # same way group_canon_stacks itself screens candidates: a JPG with no
+    # raw sibling at its own number (i.e. not an ordinary RAW+JPG pair) that
+    # was not explicitly ruled out as a composite.
+    raw_keys = {
+        (record.folder, record.number)
+        for record in records
+        if record.ext == canon_stacks.RAW_EXT
+    }
+    unresolved: list["canon_stacks.CanonStackGroup"] = []
+    for record in records:
+        if record.ext != ".jpg" or not is_target(record.folder):
+            continue
+        if record.depth_composite is False:
+            continue
+        key = (record.folder, record.number)
+        if key in raw_keys or key in grouped_keys:
+            continue
+        unresolved.append(
+            canon_stacks.CanonStackGroup(
+                output_jpg=record,
+                frames=(),
+                confidence="no-frames-found",
+                notes=("no CR3 frames could be found for this composite",),
             )
         )
 
     singles: list[str] = []
     single_sources: list[str] = []
     for record in records:
-        if record.ext != canon_stacks.RAW_EXT:
+        if record.ext != canon_stacks.RAW_EXT or not is_target(record.folder):
             continue
         source = source_path(record)
         if source in claimed_sources:
@@ -3280,13 +3345,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def parse_arguments(argv=None) -> argparse.Namespace:
+def parse_arguments(
+    argv=None, parser: argparse.ArgumentParser | None = None
+) -> argparse.Namespace:
     """Parse Stackcopy command-line arguments.
 
     A thin wrapper over build_parser() so tests (and other callers) can
-    parse an explicit argv list without running main().
+    parse an explicit argv list without running main(). ``parser`` is an
+    internal hook so a caller that also needs the parser object afterward
+    (main(), for its later ``.error()``/``.print_help()`` calls) can supply
+    one it already built instead of a second one being constructed here.
     """
-    return build_parser().parse_args(argv)
+    if parser is None:
+        parser = build_parser()
+    return parser.parse_args(argv)
 
 
 def main():
@@ -3331,7 +3403,7 @@ def main():
     lightroom_source_remains_count = 0
 
     parser = build_parser()
-    args = parse_arguments()
+    args = parse_arguments(parser=parser)
 
     # Say which Stackcopy this is without being asked.  On stderr, because
     # stdout has to stay usable for pipes and is exactly one JSON object under
@@ -3566,15 +3638,19 @@ def main():
             f"{len(plan.singles)} loose CR3 file(s)."
         )
         if plan.unresolved:
-            print(
-                f"{len(plan.unresolved)} composite(s) could not be grouped "
-                "with confidence and were left unresolved."
-            )
+            print(f"{len(plan.unresolved)} composite(s) could not be grouped:")
+            for group in plan.unresolved:
+                reason = group.notes[0] if group.notes else "no frames found"
+                unresolved_src = os.path.join(
+                    source_dir, group.output_jpg.folder, group.output_jpg.name
+                )
+                print(f"  {display_path(unresolved_src)}: {reason}")
         if args.verbose:
             for stack in plan.stacks:
+                note = f"  ({'; '.join(stack.notes)})" if stack.notes else ""
                 print(
                     f"  {display_path(stack.dest_dir)}  "
-                    f"{len(stack.frame_sources)} frame(s)"
+                    f"{len(stack.frame_sources)} frame(s){note}"
                 )
         sys.exit(0)
     else:  # --stackcopy mode
