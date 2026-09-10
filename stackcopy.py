@@ -21,6 +21,7 @@ import errno
 import json
 import subprocess
 import dng_converter
+import helicon_focus
 from urllib.parse import quote
 from bisect import bisect_left
 from collections import defaultdict
@@ -3398,7 +3399,54 @@ def run_canon_import(args) -> int:
             f"{len(plan.singles) - failed_singles} loose CR3 file(s) copied, "
             f"{failed_singles} failed."
         )
-    return 1 if (stack_failures or failed_singles) else 0
+
+    # Rendering happens last, after every frame that will ever exist for a
+    # stack has been written. A missing Helicon install fails the whole run
+    # loudly (the flag was explicitly requested; silently skipping it is a
+    # defect this branch has already had to fix twice), but one stack's
+    # render failure must not stop the rest from being attempted.
+    render_failures = 0
+    if args.render_helicon and not args.dry_run:
+        helicon = helicon_focus.find_helicon()
+        if helicon is None:
+            print(
+                "Helicon Focus was not found. Install it or set "
+                f"{helicon_focus.HELICON_ENV}."
+            )
+            return 1
+        for stack in plan.stacks:
+            if stack.dest_dir in failed_stack_dirs:
+                continue
+            if converter is not None:
+                frames = sorted(
+                    os.path.join(stack.dest_dir, name)
+                    for name in os.listdir(stack.dest_dir)
+                    if name.lower().endswith(".dng")
+                )
+            else:
+                frames = [
+                    os.path.join(stack.dest_dir, os.path.basename(source))
+                    for source in stack.frame_sources
+                ]
+            output = os.path.join(
+                os.path.dirname(stack.dest_dir),
+                f"{os.path.basename(stack.dest_dir)} helicon.jpg",
+            )
+            try:
+                result = helicon_focus.render_stack(
+                    helicon, frames, output, method=args.helicon_method
+                )
+            except Exception as error:
+                render_failures += 1
+                print(f"  Helicon failed: {display_path(output)}: {error}")
+                continue
+            if result.error:
+                render_failures += 1
+                print(f"  Helicon failed: {display_path(output)}: {result.error}")
+            elif args.verbose and result.rendered:
+                print(f"  Rendered {display_path(output)}")
+
+    return 1 if (stack_failures or failed_singles or render_failures) else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3608,6 +3656,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Copy CR3 frames as-is instead of converting them to DNG.",
     )
+    parser.add_argument(
+        "--render-helicon",
+        action="store_true",
+        help=(
+            "After importing, render each stack with Helicon Focus to "
+            "'<stack> helicon.jpg' beside its folder."
+        ),
+    )
+    parser.add_argument(
+        "--helicon-method",
+        type=int,
+        choices=(0, 1, 2),
+        default=2,
+        metavar="N",
+        help="Helicon rendering method: 0=A, 1=B, 2=C (default: 2).",
+    )
 
     return parser
 
@@ -3696,6 +3760,10 @@ def main():
         parser.error("--dng-jobs can only be used with --canon-import.")
     if args.no_dng and not args.canon_import:
         parser.error("--no-dng can only be used with --canon-import.")
+    if args.render_helicon and not args.canon_import:
+        parser.error("--render-helicon can only be used with --canon-import.")
+    if args.helicon_method != 2 and not args.canon_import:
+        parser.error("--helicon-method can only be used with --canon-import.")
     if args.dng_jobs < 1:
         parser.error("--dng-jobs must be at least 1.")
 

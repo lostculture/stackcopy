@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -493,3 +494,221 @@ def test_no_adjacent_folder_proceeds_normally(tmp_path, monkeypatch, capsys):
 
     assert exit_code == 0
     assert captured["folders"] == {"200EOSR6"}
+
+
+# --- Task 11: Helicon Focus rendering wiring --------------------------------
+
+
+def _one_stack_plan(tmp_path):
+    """A single real one-frame stack, with real bytes to copy on disk."""
+    src = tmp_path / "src"
+    src.mkdir(exist_ok=True)
+    (src / "IMG_0001.CR3").write_bytes(b"frame-one")
+    (src / "IMG_0001.JPG").write_bytes(b"composite-one")
+    stack_dir = tmp_path / "dst" / "2026-01-01" / "IMG_0001"
+    plan = stackcopy.CanonImportPlan(
+        stacks=(
+            stackcopy.CanonPlannedStack(
+                dest_dir=str(stack_dir),
+                jpg_src=str(src / "IMG_0001.JPG"),
+                jpg_dest=str(stack_dir / "IMG_0001.JPG"),
+                frame_sources=(str(src / "IMG_0001.CR3"),),
+            ),
+        ),
+        singles=(), single_sources=(), unresolved=(),
+    )
+    return plan, stack_dir
+
+
+def _two_stack_plan(tmp_path):
+    """Two independent real one-frame stacks, with real bytes on disk."""
+    src = tmp_path / "src"
+    src.mkdir(exist_ok=True)
+    stacks = []
+    stack_dirs = []
+    for n in (1, 2):
+        (src / f"IMG_000{n}.CR3").write_bytes(f"frame-{n}".encode())
+        (src / f"IMG_000{n}.JPG").write_bytes(f"composite-{n}".encode())
+        stack_dir = tmp_path / "dst" / "2026-01-01" / f"IMG_000{n}"
+        stack_dirs.append(stack_dir)
+        stacks.append(
+            stackcopy.CanonPlannedStack(
+                dest_dir=str(stack_dir),
+                jpg_src=str(src / f"IMG_000{n}.JPG"),
+                jpg_dest=str(stack_dir / f"IMG_000{n}.JPG"),
+                frame_sources=(str(src / f"IMG_000{n}.CR3"),),
+            )
+        )
+    plan = stackcopy.CanonImportPlan(
+        stacks=tuple(stacks), singles=(), single_sources=(), unresolved=(),
+    )
+    return plan, stack_dirs
+
+
+def test_render_helicon_missing_binary_fails_clearly(tmp_path, monkeypatch, capsys):
+    """A requested render with no Helicon install must fail loudly, not skip.
+
+    This is the specific defect this branch has already had to fix twice
+    for other flags: a feature that was explicitly asked for silently
+    turning into a no-op. Exit code and message must both say so.
+    """
+    plan, stack_dir = _one_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(stackcopy.helicon_focus, "find_helicon", lambda: None)
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--no-dng", "--render-helicon"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Helicon Focus was not found" in output
+    assert stackcopy.helicon_focus.HELICON_ENV in output
+    # The import itself must not be held hostage by a missing renderer: the
+    # frame and composite it already had everything it needed to copy are
+    # still copied.
+    assert (stack_dir / "IMG_0001.CR3").read_bytes() == b"frame-one"
+
+
+def test_render_helicon_not_invoked_under_dry_run(tmp_path, monkeypatch):
+    """--dry must never shell out to Helicon: a dry run writes nothing."""
+    plan, _ = _one_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+
+    def _must_not_be_called():
+        raise AssertionError("find_helicon() must not run under --dry")
+
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "find_helicon", _must_not_be_called
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--no-dng", "--render-helicon", "--dry"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+
+    assert exit_code == 0
+
+
+def test_render_helicon_failure_on_one_stack_does_not_abort_the_run(
+    tmp_path, monkeypatch, capsys
+):
+    """One stack's render failure must be reported and counted, not fatal.
+
+    The second stack must still be attempted: a bad frame in stack one is
+    not evidence anything is wrong with stack two.
+    """
+    plan, stack_dirs = _two_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
+    )
+
+    calls = []
+
+    def fake_render_stack(helicon, frames, output_path, method=2, **kwargs):
+        calls.append(output_path)
+        if len(calls) == 1:
+            return stackcopy.helicon_focus.RenderResult(
+                output_path, error="stub render failed"
+            )
+        return stackcopy.helicon_focus.RenderResult(output_path, rendered=True)
+
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "render_stack", fake_render_stack
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--no-dng", "--render-helicon"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+    output = capsys.readouterr().out
+
+    assert len(calls) == 2, "the second stack must still be attempted"
+    assert exit_code == 1
+    assert "Helicon failed" in output
+    assert "stub render failed" in output
+
+
+def test_render_helicon_uses_raw_frames_when_no_dng(tmp_path, monkeypatch):
+    """--no-dng: Helicon must render from the copied raw frames, not DNGs."""
+    plan, stack_dir = _one_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
+    )
+
+    captured = {}
+
+    def fake_render_stack(helicon, frames, output_path, method=2, **kwargs):
+        captured["frames"] = frames
+        return stackcopy.helicon_focus.RenderResult(output_path, rendered=True)
+
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "render_stack", fake_render_stack
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--no-dng", "--render-helicon"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+
+    assert exit_code == 0
+    assert captured["frames"] == [str(stack_dir / "IMG_0001.CR3")]
+
+
+def test_render_helicon_uses_dng_frames_after_conversion(tmp_path, monkeypatch):
+    """When conversion ran, Helicon must render the produced DNGs, not CR3s."""
+    plan, stack_dir = _one_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
+    )
+    monkeypatch.setattr(stackcopy.dng_converter, "preflight", lambda *a, **k: None)
+
+    def fake_convert_groups(converter, jobs_by_dest, workers=1, on_progress=None):
+        results = []
+        for dest_dir, files in jobs_by_dest:
+            for source in files:
+                stem = os.path.splitext(os.path.basename(source))[0]
+                Path(dest_dir, f"{stem}.dng").write_bytes(b"fake-dng")
+            results.append(stackcopy.dng_converter.ConversionResult(
+                dest_dir, converted=len(files)
+            ))
+        return results
+
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "convert_groups", fake_convert_groups
+    )
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
+    )
+
+    captured = {}
+
+    def fake_render_stack(helicon, frames, output_path, method=2, **kwargs):
+        captured["frames"] = frames
+        return stackcopy.helicon_focus.RenderResult(output_path, rendered=True)
+
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "render_stack", fake_render_stack
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--render-helicon"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+
+    assert exit_code == 0
+    assert captured["frames"] == [str(stack_dir / "IMG_0001.dng")]
