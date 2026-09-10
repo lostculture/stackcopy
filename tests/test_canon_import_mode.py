@@ -574,8 +574,18 @@ def test_render_helicon_missing_binary_fails_clearly(tmp_path, monkeypatch, caps
 
 
 def test_render_helicon_not_invoked_under_dry_run(tmp_path, monkeypatch):
-    """--dry must never shell out to Helicon: a dry run writes nothing."""
-    plan, _ = _one_stack_plan(tmp_path)
+    """--dry must never shell out to Helicon: a dry run writes nothing.
+
+    The real gate is run_canon_import's own early ``if args.dry_run: ...
+    return 0`` -- reached long before the render block, and before the copy
+    loop too -- not a second dry-run check inside the render block itself
+    (there isn't one: it would be dead code, since dry_run can never be True
+    by the time that block runs). This test pins that real, single gate
+    directly: nothing is copied to disk, and Helicon is never even looked
+    up. Deleting or bypassing the early return is what would make this
+    fail; a decorative second check inside the render block would not.
+    """
+    plan, stack_dir = _one_stack_plan(tmp_path)
     monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
 
@@ -593,6 +603,7 @@ def test_render_helicon_not_invoked_under_dry_run(tmp_path, monkeypatch):
     exit_code = stackcopy.run_canon_import(args)
 
     assert exit_code == 0
+    assert not stack_dir.exists(), "a dry run must write nothing at all"
 
 
 def test_render_helicon_failure_on_one_stack_does_not_abort_the_run(
@@ -712,3 +723,44 @@ def test_render_helicon_uses_dng_frames_after_conversion(tmp_path, monkeypatch):
 
     assert exit_code == 0
     assert captured["frames"] == [str(stack_dir / "IMG_0001.dng")]
+
+
+def test_render_helicon_skips_a_stack_whose_copy_already_failed(
+    tmp_path, monkeypatch
+):
+    """A stack already recorded as failed must not also be handed to Helicon.
+
+    Rendering it would only produce a second, redundant "no frames to
+    render" failure on top of the real one already reported for the copy
+    that never happened -- confusing noise, not new information.
+    """
+    plan, stack_dirs = _two_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
+    )
+
+    # Make the first stack's frame copy fail: its source vanishes before
+    # run_canon_import ever touches it, so safe_file_operation reports it as
+    # failed and its dest_dir lands in failed_stack_dirs.
+    os.remove(plan.stacks[0].frame_sources[0])
+
+    calls = []
+
+    def fake_render_stack(helicon, frames, output_path, method=2, **kwargs):
+        calls.append(output_path)
+        return stackcopy.helicon_focus.RenderResult(output_path, rendered=True)
+
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "render_stack", fake_render_stack
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--no-dng", "--render-helicon"]
+    )
+    stackcopy.run_canon_import(args)
+
+    assert len(calls) == 1, "only the healthy second stack should be rendered"
+    assert stack_dirs[1].name in calls[0]

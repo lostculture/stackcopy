@@ -3405,8 +3405,15 @@ def run_canon_import(args) -> int:
     # loudly (the flag was explicitly requested; silently skipping it is a
     # defect this branch has already had to fix twice), but one stack's
     # render failure must not stop the rest from being attempted.
+    #
+    # No `and not args.dry_run` guard here: this code is already unreachable
+    # under --dry, because run_canon_import returns unconditionally above
+    # (see "if args.dry_run: ... return 0"), well before the copy loop and
+    # long before this point. A second dry-run check here would be dead --
+    # it could never see dry_run True -- and dead conditions are exactly the
+    # kind of thing that reads as a safety guard but tests nothing.
     render_failures = 0
-    if args.render_helicon and not args.dry_run:
+    if args.render_helicon:
         helicon = helicon_focus.find_helicon()
         if helicon is None:
             print(

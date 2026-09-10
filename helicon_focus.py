@@ -100,18 +100,28 @@ def render_stack(
     jpeg_quality: int = DEFAULT_JPEG_QUALITY,
     timeout: float | None = None,
 ) -> RenderResult:
-    """Render one stack.  An existing output is left alone so runs resume."""
+    """Render one stack.  An existing output is left alone so runs resume.
+
+    This function must be safe to call on its own: every filesystem step it
+    takes -- creating the output directory, writing the frame list, running
+    Helicon, and cleaning the frame list back up -- is inside the guarded
+    region below, so an OSError anywhere in it (a full disk, a permissions
+    error, a path that collides with an existing file) becomes a failed
+    RenderResult rather than an exception a caller has to know to catch.
+    """
     if os.path.exists(output_path):
         return RenderResult(output_path, rendered=False, skipped=True)
     if not frames:
         return RenderResult(output_path, error="no frames to render")
 
-    directory = os.path.dirname(output_path) or "."
-    os.makedirs(directory, exist_ok=True)
-    listing = write_file_list(frames, directory)
     if timeout is None:
         timeout = RENDER_TIMEOUT_PER_FRAME_SECONDS * len(frames)
+
+    listing = None
     try:
+        directory = os.path.dirname(output_path) or "."
+        os.makedirs(directory, exist_ok=True)
+        listing = write_file_list(frames, directory)
         completed = subprocess.run(
             render_command(
                 helicon, listing, output_path,
@@ -133,10 +143,11 @@ def render_stack(
             output_path, error=f"Helicon could not be run: {error}"
         )
     finally:
-        try:
-            os.unlink(listing)
-        except OSError:
-            pass
+        if listing is not None:
+            try:
+                os.unlink(listing)
+            except OSError:
+                pass
 
     if not os.path.exists(output_path):
         return RenderResult(
@@ -144,6 +155,20 @@ def render_stack(
             error=(
                 f"Helicon exited {completed.returncode} without writing "
                 f"{os.path.basename(output_path)}"
+            ),
+        )
+    if completed.returncode != 0:
+        # A file landed on disk, but Helicon still reported failure -- the
+        # output may be a partial or truncated render. Success requires
+        # both signals to agree (mirrors dng_converter's _convert_group),
+        # so this must be reported as a failure the user can act on, never
+        # guessed at as a success because a file merely happens to exist.
+        return RenderResult(
+            output_path,
+            error=(
+                f"Helicon exited {completed.returncode} after writing "
+                f"{os.path.basename(output_path)}; the output may be "
+                "incomplete or corrupt even though a file was produced"
             ),
         )
     return RenderResult(output_path, rendered=True)

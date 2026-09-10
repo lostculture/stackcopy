@@ -60,6 +60,41 @@ def test_render_succeeds_when_output_appears(tmp_path):
     assert result.error is None
 
 
+def test_render_reports_failure_when_exit_nonzero_despite_output(tmp_path):
+    """Exit code and output-file existence must both agree on success.
+
+    A file landing on disk does not mean the render is trustworthy: Helicon
+    can write a partial file and still report failure. Treating that as
+    success would be exactly the silently-wrong render this feature exists
+    to prevent.
+    """
+    out = tmp_path / "out.jpg"
+    stub = make_stub(tmp_path, f'echo img > "{out}"\nexit 1')
+    result = helicon_focus.render_stack(
+        stub, [str(tmp_path / "a.dng")], str(out)
+    )
+    assert result.rendered is False
+    assert result.error is not None
+    assert "1" in result.error
+    assert out.exists(), "the (untrustworthy) file is left in place, not deleted"
+
+
+def test_render_reports_failure_when_output_directory_cannot_be_created(tmp_path):
+    """helicon_focus must be safe standalone: an OSError creating the output
+    directory (or writing the frame list) must become a failed RenderResult,
+    never an uncaught exception a caller has to know to guard against.
+    """
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"not a directory")
+    out = blocker / "sub" / "out.jpg"
+    stub = make_stub(tmp_path, "exit 1")  # would fail loudly if it ran at all
+    result = helicon_focus.render_stack(
+        stub, [str(tmp_path / "a.dng")], str(out)
+    )
+    assert result.rendered is False
+    assert result.error is not None
+
+
 def test_existing_output_is_not_rerendered(tmp_path):
     out = tmp_path / "out.jpg"
     out.write_bytes(b"already rendered")
