@@ -50,3 +50,64 @@ def test_unparseable_records_are_skipped():
     assert len(frames) == 1
     assert frames[0].number == 1
     assert frames[0].depth_composite is None
+
+
+def groups_by_output(groups):
+    return {g.output_jpg.name: g for g in groups}
+
+
+def test_ordinary_25_frame_stack_anchors_exactly(records):
+    groups = groups_by_output(canon_stacks.group_canon_stacks(records))
+    group = groups["IMG_0040.JPG"]
+    assert group.confidence == canon_stacks.CONFIDENCE_ANCHOR
+    assert len(group.frames) == 25
+    assert group.frames[0].name == "IMG_0015.CR3"
+    assert group.frames[-1].name == "IMG_0039.CR3"
+
+
+def test_anchor_excludes_earlier_ordinary_shots(records):
+    """IMG_0096's naive run is 29 frames; four are unrelated shots from an
+    hour earlier.  The anchor lands on IMG_0071 and yields exactly 25."""
+    group = groups_by_output(canon_stacks.group_canon_stacks(records))[
+        "IMG_0096.JPG"
+    ]
+    assert group.confidence == canon_stacks.CONFIDENCE_ANCHOR
+    assert len(group.frames) == 25
+    assert group.frames[0].name == "IMG_0071.CR3"
+    names = {f.name for f in group.frames}
+    for excluded in ("IMG_0067.CR3", "IMG_0068.CR3",
+                     "IMG_0069.CR3", "IMG_0070.CR3"):
+        assert excluded not in names
+
+
+def test_short_groups_are_real_stacks(records):
+    groups = groups_by_output(canon_stacks.group_canon_stacks(records))
+    assert len(groups["IMG_1172.JPG"].frames) == 3
+    assert len(groups["IMG_1168.JPG"].frames) == 1
+
+
+@pytest.mark.xfail(strict=True, reason="cadence fallback lands in Task 3")
+def test_every_composite_jpg_produces_a_group(records):
+    groups = canon_stacks.group_canon_stacks(records)
+    assert len([g for g in groups if g.output_jpg.folder == "108EOSR6"]) == 101
+
+
+def test_non_composite_jpg_is_not_grouped():
+    frames = [
+        canon_stacks.CanonFrame("108EOSR6", 1, ".cr3", "IMG_0001.CR3",
+                                timestamp=100.0, depth_composite=False),
+        canon_stacks.CanonFrame("108EOSR6", 2, ".jpg", "IMG_0002.JPG",
+                                timestamp=100.0, depth_composite=False),
+    ]
+    assert canon_stacks.group_canon_stacks(frames) == []
+
+
+def test_jpg_with_matching_cr3_is_not_grouped():
+    """A RAW+JPG pair shares its number and is an ordinary shot."""
+    frames = [
+        canon_stacks.CanonFrame("108EOSR6", 5, ".cr3", "IMG_0005.CR3",
+                                timestamp=100.0, depth_composite=True),
+        canon_stacks.CanonFrame("108EOSR6", 5, ".jpg", "IMG_0005.JPG",
+                                timestamp=100.0, depth_composite=True),
+    ]
+    assert canon_stacks.group_canon_stacks(frames) == []

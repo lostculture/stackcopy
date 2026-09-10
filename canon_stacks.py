@@ -127,3 +127,104 @@ def records_from_exiftool_json(payload) -> list[CanonFrame]:
             )
         )
     return frames
+
+
+CONFIDENCE_ANCHOR = "anchor"
+
+MAX_CANON_STACK_FRAMES = 999  # Canon focus bracketing allows up to 999.
+
+
+@dataclass(frozen=True)
+class CanonStackGroup:
+    output_jpg: CanonFrame
+    frames: tuple[CanonFrame, ...]
+    confidence: str
+    notes: tuple[str, ...] = field(default_factory=tuple)
+
+
+def _index(records: list[CanonFrame]) -> dict[str, dict[int, dict[str, CanonFrame]]]:
+    """folder -> number -> ext -> frame."""
+    index: dict[str, dict[int, dict[str, CanonFrame]]] = {}
+    for record in records:
+        index.setdefault(record.folder, {}).setdefault(record.number, {})[
+            record.ext
+        ] = record
+    return index
+
+
+def _preceding_run(
+    index, folder: str, number: int, limit: int = MAX_CANON_STACK_FRAMES
+) -> list[CanonFrame]:
+    """CR3s immediately below ``number``, oldest first, stopping at a gap."""
+    folder_index = index.get(folder, {})
+    run: list[CanonFrame] = []
+    probe = number - 1
+    while probe >= 0 and len(run) < limit:
+        frame = folder_index.get(probe, {}).get(RAW_EXT)
+        if frame is None:
+            break
+        run.append(frame)
+        probe -= 1
+    run.reverse()
+    return run
+
+
+def _anchor_cut(run: list[CanonFrame], jpg: CanonFrame) -> list[CanonFrame] | None:
+    """Frames from the one whose timestamp equals the composite's, onward.
+
+    Compared on ExifTool's own text so sub-second precision cannot be lost to
+    float rounding; falls back to the parsed value when text is unavailable.
+    """
+    for position, frame in enumerate(run):
+        if (
+            jpg.timestamp_text is not None
+            and frame.timestamp_text == jpg.timestamp_text
+        ) or (
+            jpg.timestamp_text is None
+            and frame.timestamp is not None
+            and frame.timestamp == jpg.timestamp
+        ):
+            return run[position:]
+    return None
+
+
+def _count_note(jpg: CanonFrame, frames: list[CanonFrame]) -> tuple[str, ...]:
+    """FocusBracketingImageCount is the camera setting, never a boundary."""
+    if jpg.image_count and jpg.image_count != len(frames):
+        return (
+            f"camera reported {jpg.image_count} bracketing frames, "
+            f"grouped {len(frames)}",
+        )
+    return ()
+
+
+def group_canon_stacks(records: list[CanonFrame]) -> list[CanonStackGroup]:
+    index = _index(records)
+    groups: list[CanonStackGroup] = []
+    jpgs = sorted(
+        (r for r in records if r.ext == ".jpg"),
+        key=lambda r: (r.folder, r.number),
+    )
+    for jpg in jpgs:
+        # A JPG sharing its number with a CR3 is an ordinary RAW+JPG pair.
+        if RAW_EXT in index.get(jpg.folder, {}).get(jpg.number, {}):
+            continue
+        # An explicit "not a depth composite" rules the JPG out.  Unknown
+        # (no ExifTool) is deliberately allowed through to the heuristic.
+        if jpg.depth_composite is False:
+            continue
+        run = _preceding_run(index, jpg.folder, jpg.number)
+        if not run:
+            continue
+        frames = _anchor_cut(run, jpg)
+        if frames is None:
+            continue
+        groups.append(
+            CanonStackGroup(
+                output_jpg=jpg,
+                frames=tuple(frames),
+                confidence=CONFIDENCE_ANCHOR,
+                notes=_count_note(jpg, frames),
+            )
+        )
+    return groups
