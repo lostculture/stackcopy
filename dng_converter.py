@@ -133,8 +133,14 @@ def preflight(converter: str, sample_cr3: str) -> str | None:
         if produced and completed.returncode == 0:
             return None
 
-    hint = ""
-    if version and version < DNG_CONVERTER_MINIMUM:
+    if version is None:
+        hint = (
+            " Its version could not be determined. Raw support is "
+            "per-camera-model, so this may be an older converter that "
+            "predates the body; updating it is worth trying: "
+            f"{DNG_CONVERTER_DOWNLOAD_URL}"
+        )
+    elif version < DNG_CONVERTER_MINIMUM:
         hint = (
             f" It is older than {DNG_CONVERTER_MINIMUM_TEXT}, which is the "
             "first version supporting recent Canon bodies. Update it at "
@@ -142,8 +148,9 @@ def preflight(converter: str, sample_cr3: str) -> str | None:
         )
     else:
         hint = (
-            " This usually means the converter predates the camera model. "
-            f"Update it at {DNG_CONVERTER_DOWNLOAD_URL}"
+            " This converter cannot process this particular camera model. "
+            "Raw support is per-camera-model, so an even more recent body "
+            "may need a newer converter than this one."
         )
     return (
         f"Adobe DNG Converter ({version_text}) could not convert "

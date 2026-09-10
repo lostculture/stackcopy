@@ -57,6 +57,27 @@ def test_preflight_passes_when_dng_is_produced(tmp_path):
     assert dng_converter.preflight(stub, str(sample)) is None
 
 
+def test_preflight_failure_with_current_converter_does_not_suggest_update(
+    tmp_path, monkeypatch
+):
+    """A converter already at/above the minimum must not be told to update.
+
+    Regression for the bug where the else-branch unconditionally said "This
+    usually means the converter predates the camera model. Update it at
+    ...", even when the known version is current (e.g. 18.6). That message
+    misdirects a user who is already up to date.
+    """
+    stub = make_stub(tmp_path, "exit 1")
+    sample = tmp_path / "IMG_0001.CR3"
+    sample.write_bytes(b"not really a raw file")
+    monkeypatch.setattr(dng_converter, "converter_version", lambda p: (18, 6))
+    message = dng_converter.preflight(stub, str(sample))
+    assert message is not None
+    assert "18.6" in message
+    assert "predates the camera model" not in message
+    assert "Update it at" not in message
+
+
 def test_preflight_fails_when_exit_zero_but_no_dng_produced(tmp_path):
     """Guards the "produced file" half of the success gate in isolation.
 
