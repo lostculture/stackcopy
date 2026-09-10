@@ -220,10 +220,93 @@ def test_cross_folder_reach_respects_time_limit():
 
 
 def test_numbering_gap_bounds_a_run(records):
-    """IMG_0902 was deleted in camera; IMG_0929's stack must not span it."""
+    """Regression pin, not a gap-stop test.
+
+    IMG_0929's stack anchors at IMG_0904, which sits *after* the deleted
+    IMG_0902 -- so `_anchor_cut` discards everything before position 904
+    regardless of whether `_preceding_run` itself respects the numbering
+    gap. This only pins IMG_0929's exact 25-frame result across the Task 4
+    refactor. See `test_preceding_run_stops_at_a_numbering_gap` for a test
+    that actually exercises the gap-stop.
+    """
     group = groups_by_output(canon_stacks.group_canon_stacks(records))[
         "IMG_0929.JPG"
     ]
     numbers = [f.number for f in group.frames]
     assert 902 not in numbers
     assert numbers == list(range(min(numbers), 929))
+
+
+def test_preceding_run_stops_at_a_numbering_gap():
+    """A genuine missing file number must not be walked through.
+
+    Numbers 1-3 and 5-7 are present with a hole at 4 (as if IMG_0004 were
+    deleted in camera); the composite at 8 has no timestamp match, so this
+    goes through the cadence fallback over whatever `_preceding_run`
+    returns. The time gap across the hole (0.46s, one interval wider than
+    the uniform 0.23s cadence) is comfortably inside cadence's 4x
+    tolerance, so if `_preceding_run` failed to stop at the missing 4 and
+    walked through to 1-3, cadence would happily include them too -- this
+    is what makes the test actually exercise the numeric gap-stop, rather
+    than relying on an anchor match to discard the earlier frames anyway.
+    """
+    folder = "200TESTA"
+    numbers_times = [
+        (1, 0.0), (2, 0.23), (3, 0.46),
+        (5, 0.92), (6, 1.15), (7, 1.38),
+    ]
+    frames = [
+        canon_stacks.CanonFrame(
+            folder, n, ".cr3", f"IMG_{n:04d}.CR3",
+            timestamp_text=f"t{n}", timestamp=t, depth_composite=True,
+        )
+        for n, t in numbers_times
+    ]
+    jpg = canon_stacks.CanonFrame(
+        folder, 8, ".jpg", "IMG_0008.JPG",
+        timestamp_text="unmatched", timestamp=1.61, depth_composite=True,
+    )
+    group = canon_stacks.group_canon_stacks(frames + [jpg])[0]
+    numbers = [f.number for f in group.frames]
+    assert numbers == [5, 6, 7]
+
+
+def test_composite_with_no_local_frames_reaches_back():
+    """The composite can be the very first file in its folder.
+
+    The camera writes the composite after its last frame, so a burst whose
+    last frame is IMG_9999 puts the composite at IMG_0001.JPG in the next
+    folder with zero local preceding CR3s.
+    """
+    prev = [
+        canon_stacks.CanonFrame(
+            "107EOSR6", n, ".cr3", f"IMG_{n:04d}.CR3",
+            timestamp_text=f"t{n}", timestamp=1000.0 + (n - 9997) * 0.23,
+            depth_composite=True,
+        )
+        for n in (9997, 9998, 9999)
+    ]
+    jpg = canon_stacks.CanonFrame(
+        "108EOSR6", 1, ".jpg", "IMG_0001.JPG",
+        timestamp_text="t9997", timestamp=1000.69, depth_composite=True,
+    )
+    group = canon_stacks.group_canon_stacks(prev + [jpg])[0]
+    assert group.confidence == canon_stacks.CONFIDENCE_ANCHOR_CROSSFOLDER
+    assert [f.folder for f in group.frames] == ["107EOSR6"] * 3
+    assert [f.number for f in group.frames] == [9997, 9998, 9999]
+
+
+def test_composite_with_no_local_frames_respects_time_limit():
+    """An unrelated old frame at the adjacent number, in the previous
+    folder, is not borrowed just because it shares the composite's
+    timestamp text -- even when there is no local run to compare against,
+    the composite's own timestamp bounds the borrow."""
+    old = canon_stacks.CanonFrame(
+        "107EOSR6", 9999, ".cr3", "IMG_9999.CR3",
+        timestamp_text="match", timestamp=0.0, depth_composite=True,
+    )
+    jpg = canon_stacks.CanonFrame(
+        "108EOSR6", 1, ".jpg", "IMG_0001.JPG",
+        timestamp_text="match", timestamp=100000.0, depth_composite=True,
+    )
+    assert canon_stacks.group_canon_stacks([old, jpg]) == []

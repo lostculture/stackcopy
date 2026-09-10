@@ -255,10 +255,15 @@ def _extend_across_folder(
 ) -> list[CanonFrame] | None:
     """Borrow frames from the previous folder's tail to complete a stack.
 
-    Only reached when the backward walk consumed its whole folder without
-    finding the anchor.  A borrowed frame must also be plausibly part of the
-    same capture: metadata proves the JPG is a composite, but proves nothing
-    about a file sitting in a different folder.
+    Called whenever the local anchor cut fails to find a match in ``run`` --
+    including when ``run`` is empty, which happens when the composite is the
+    very first file in its folder (the camera writes the composite after its
+    last frame, so a burst whose last frame is IMG_9999 puts the composite at
+    IMG_0001.JPG in the next folder with no local CR3s at all).  A borrowed
+    frame must also be plausibly part of the same capture: metadata proves
+    the JPG is a composite, but proves nothing about a file sitting in a
+    different folder, so the result is still bounded by
+    ``MAX_CROSS_FOLDER_GAP_SECONDS``.
     """
     previous = _previous_folder(index, folder)
     if previous is None:
@@ -278,7 +283,10 @@ def _extend_across_folder(
     if frames is None:
         return None
     anchor_time = frames[0].timestamp
-    oldest_local = run[0].timestamp if run else None
+    # With no local frames there is nothing to anchor the gap check to
+    # except the composite's own timestamp -- without this, an empty
+    # ``run`` would leave the borrow completely unguarded.
+    oldest_local = run[0].timestamp if run else jpg.timestamp
     if (
         anchor_time is not None
         and oldest_local is not None
@@ -303,15 +311,14 @@ def group_canon_stacks(records: list[CanonFrame]) -> list[CanonStackGroup]:
         # (no ExifTool) is deliberately allowed through to the heuristic.
         if jpg.depth_composite is False:
             continue
+        # An empty run is not a dead end: the composite can legitimately be
+        # the first file in its folder, with its stack entirely in the
+        # previous one (see _extend_across_folder's docstring).
         run = _preceding_run(index, jpg.folder, jpg.number)
-        if not run:
-            continue
         frames = _anchor_cut(run, jpg)
         confidence = CONFIDENCE_ANCHOR
         notes: tuple[str, ...] = ()
-        if frames is None and len(run) == len(
-            _preceding_run(index, jpg.folder, jpg.number)
-        ):
+        if frames is None:
             borrowed = _extend_across_folder(index, jpg.folder, run, jpg)
             if borrowed is not None:
                 frames = borrowed
@@ -319,7 +326,7 @@ def group_canon_stacks(records: list[CanonFrame]) -> list[CanonStackGroup]:
                 notes = (
                     f"stack spans {borrowed[0].folder} into {jpg.folder}",
                 )
-        if frames is None:
+        if frames is None and run:
             frames = _cadence_cut(run)
             confidence = CONFIDENCE_CADENCE
             notes = (
