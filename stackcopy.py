@@ -31,7 +31,7 @@ from datetime import datetime, date, timedelta
 from enum import Enum
 from typing import Any
 
-STACKCOPY_VERSION = "1.6.0"
+STACKCOPY_VERSION = "1.7.0"
 
 # ---------------------------------------------------------------------------
 # Platform helpers

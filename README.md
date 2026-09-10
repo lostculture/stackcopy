@@ -1,8 +1,8 @@
 # stackcopy
 
-Olympus / OM-System in-camera stacking produces many RAW/JPG frames per final JPG. Other importers like Lightroom don't automatically group or separate them, so imports get cluttered. This script separates originals from stacked outputs automatically, so you only need to process the photos that need your attention.
+Olympus / OM-System in-camera stacking produces many RAW/JPG frames per final JPG. Other importers like Lightroom don't automatically group or separate them, so imports get cluttered. This script separates originals from stacked outputs automatically, so you only need to process the photos that need your attention. `--canon-import` does the same job for Canon's in-camera depth-composite focus stacks, converting the source CR3 frames to DNG along the way.
 
-Works on Linux, macOS, WSL, and Windows. Tested on OM System OM1 & OM System OM5.
+Works on Linux, macOS, WSL, and Windows. Tested on OM System OM1 & OM System OM5, and on the Canon EOS R6 Mark II.
 
 Prefer a window to the command line? There's a point-and-click [graphical interface](#graphical-interface-gui) for the import workflow.
 
@@ -48,7 +48,98 @@ still used.
 
 The matching is case-insensitive, so `IMG_1234.JPG` will match with `img_1234.orf` just fine.
 
-Supported RAW extensions: `.orf`, `.cr2`, `.nef`, `.arw`, `.dng`, `.pef`, `.rw2`, `.raf`, `.raw`, `.sr2`. Olympus/OM `.ORI` originals are preserved as a separate companion type, so an `.ORF` and `.ORI` with the same stem cannot replace one another. An `.ORI` counts as a companion original (a JPG that has one is not treated as an unpaired in-camera output) but it is not ordinary RAW backing, so it never makes a frame look like a RAW-backed focus-stack input on its own.
+Supported RAW extensions: `.orf`, `.cr2`, `.nef`, `.arw`, `.dng`, `.pef`, `.rw2`, `.raf`, `.raw`, `.sr2`, `.cr3`. Olympus/OM `.ORI` originals are preserved as a separate companion type, so an `.ORF` and `.ORI` with the same stem cannot replace one another. An `.ORI` counts as a companion original (a JPG that has one is not treated as an unpaired in-camera output) but it is not ordinary RAW backing, so it never makes a frame look like a RAW-backed focus-stack input on its own.
+
+### Canon in-camera depth-composite stacks
+
+`--canon-import` is a separate detection path for a different camera family
+and a different kind of in-camera stack: Canon's depth-composite focus
+bracketing, which writes one composite JPG plus the CR3 frames that fed it.
+It shares nothing with the Olympus/OM heuristic above; it is described here
+because it lives in the same "How it works" section.
+
+The gate is the Canon MakerNote `FocusBracketingDepthComposite`: it is how a
+composite JPG identifies itself as camera-stacked output at all. A JPG the
+camera explicitly marked as *not* a depth composite is ruled out; a JPG with
+no answer (no ExifTool, or a tag ExifTool could not read) is allowed through
+to the fallback heuristic below rather than rejected.
+
+Once a JPG passes the gate, Stackcopy needs to know exactly which preceding
+CR3s belong to it. It walks backward through the contiguous run of CR3s in
+the same camera folder and looks for the one frame whose `SubSecDateTimeOriginal`
+is byte-identical to the composite's own - the camera writes the same
+sub-second timestamp onto the composite and onto the first frame that fed it,
+and nothing else shares it. Cutting the run at that exact frame is what makes
+grouping exact rather than a guess. On a real 2,437-file EOS R6 Mark II card,
+100 of 101 composites anchored within their own folder this way: 95 of those
+at the very first frame of an unbroken run, and 5 mid-run, where naively
+treating "every contiguous CR3" as the stack would have silently absorbed
+unrelated earlier shots. On that card, one such composite (`IMG_0096`) sits
+behind 29 contiguous CR3s but only 25 belong to its stack; the other four were
+taken roughly an hour earlier and just happen to have consecutive file
+numbers.
+
+The camera also reports `FocusBracketingImageCount` - its own configured
+bracketing setting - on the composite. It is tempting to use this as the
+stack size, but it is a trap: it is the number of shots the camera was *told*
+to take, not the number that actually make up this composite. The same
+`IMG_0096` reports a count of 25, matching its true stack, while sitting
+behind 29 preceding frames; on a different composite the count and the true
+size can simply disagree because the photographer changed settings between
+brackets. Stackcopy therefore never uses `FocusBracketingImageCount` to bound
+a group. It is surfaced only as an informational note when it disagrees with
+the frames actually grouped - useful context, never a boundary. Anyone
+extending this code should not be tempted to use it as one either.
+
+When no frame's timestamp matches the composite's at all (no ExifTool, or a
+card where sub-second timestamps were not preserved), Stackcopy falls back to
+cadence: walking backward from the newest frame while the interval between
+consecutive shots stays consistent with the run's own recent pace. That
+threshold is relative to the tail of the run - four times the median interval
+of its last few gaps - never an absolute number of seconds, because how fast
+a camera can shoot varies with exposure. On the test card, intra-stack
+intervals ran as fast as 0.07s at a 1/6s shutter speed and as slow as 0.23s on
+a dimmer run, and flash recycling changes the pace again. A fixed threshold
+tuned for one of those would misfire on the others.
+
+Canon also rolls the in-camera file counter from `IMG_9999.CR3` over into
+`IMG_0001.CR3` in a *new* camera folder (`107EOSR6` to `108EOSR6`), so a
+stack's frames can span that boundary exactly the way an Olympus stack can
+span `100OMSYS`/`101OMSYS`. On the test card, `IMG_0014.JPG` needs 12 frames
+from the previous folder, `107EOSR6`, to complete its 25-frame stack.
+Stackcopy scans the numerically adjacent *previous* camera folder purely as
+borrowable context for this: composites found in that previous folder are
+never grouped into stacks of their own from this scan, and its CR3s never
+become singles - they either get pulled into a stack reaching back from the
+current folder, or they are simply not touched.
+
+ExifTool is **optional** for Canon detection, exactly as it already is for
+the Olympus path above: without it, Stackcopy has no `SubSecDateTimeOriginal`
+or `FocusBracketingDepthComposite` to read, detection degrades straight to
+the cadence heuristic, and Stackcopy prints one concise warning rather than
+failing.
+
+Frame conversion needs **Adobe DNG Converter, 15.1 or newer**, found at its
+standard install location or via `STACKCOPY_DNG_CONVERTER`. The 15.1 floor
+matters less than what it implies: raw support in the converter is
+**per-camera-model, not per-format**. The converter does not "support CR3";
+it carries a decoding profile for each camera body, and a converter released
+before a given body exists cannot read that body's CR3s no matter how
+standard the container looks. Adobe DNG Converter 13.0 (2020) rejects every
+CR3 from an EOS R6 Mark II (released 2022) in about a second; Adobe DNG
+Converter 18.6 converts the same file in about three. Because a version
+number alone cannot prove a converter can read a specific camera's files
+correctly, Stackcopy always runs one real trial conversion before importing
+anything, on the first frame it finds. If that fails, the import stops in
+the first second with an actionable message - identifying the likely cause
+and where to get a newer converter - instead of failing partway through a
+65 GB import several hours in.
+
+This detection and conversion path has so far been exercised against a
+single camera body, the Canon EOS R6 Mark II, and a single test card. It
+should generalize to other recent EOS R and PowerShot bodies that write the
+same `FocusBracketingDepthComposite`/`FocusBracketingImageCount` MakerNotes,
+but that has not been verified.
 
 Supported video extensions for `--lightroomimport`: `.mov`, `.mp4`, `.m4v`, `.avi`, `.mts`, `.m2ts`, `.mpg`, `.mpeg`, `.wmv`.
 
@@ -202,7 +293,7 @@ Skipping it still produces a working build; the app just uses ExifTool from
 PyInstaller can't cross-compile, so build the macOS app on a Mac and the
 Windows app on Windows, or just let the workflow do both.
 
-## The five modes
+## The six modes
 
 ### `--copy SRC_DIR DEST_DIR`
 
@@ -250,6 +341,22 @@ Want to review the plan before it runs? Use interactive mode:
 ./stackcopy.py --lightroomimport /photos/camera-import/ -i
 ```
 
+### `--canon-import SRC_DIR DEST_DIR`
+
+Imports Canon in-camera depth-composite focus stacks. Copies each stack's CR3
+frames into their own folder (converting them to DNG along the way, so
+Helicon Focus can open them directly), copies the camera's composite JPG
+alongside them for reference, and copies loose CR3s that belong to no stack
+to a separate singles folder. The card itself is never modified - every
+operation is a copy. See [Canon in-camera depth-composite stacks](#canon-in-camera-depth-composite-stacks)
+for how stacks are detected and [Where files go](#where-files-go) for the
+exact layout.
+
+```bash
+./stackcopy.py --canon-import /media/EOS_DIGITAL/DCIM/108EOSR6 "/photos/Stacked Images" \
+    --singles-dir "/photos/Single Images" --verbose
+```
+
 ## Where files go
 
 ### Stack input files
@@ -275,6 +382,37 @@ Override with the `STACKCOPY_LIGHTROOM_IMPORT_DIR` environment variable.
 The `YYYY/YYYY-MM-DD` directories are based on each file's filesystem modification time, not EXIF `DateTimeOriginal`. On a camera card, this modification time normally corresponds to when the photograph or video was captured.
 
 On Linux/WSL, `<Pictures>` is `~/pictures` if that directory exists, otherwise `~/Pictures`. On Windows, it's your system Pictures folder.
+
+### Canon depth-composite import
+
+`--canon-import` lays files out differently from every other mode, on purpose:
+
+```
+<DEST_DIR>/YYYY-MM-DD/IMG_0014/          one folder per stack, named for the composite
+    IMG_9988.dng ... IMG_0013.dng          the stack's frames, converted to DNG
+    IMG_0014.JPG                           the camera's own composite, for reference
+<DEST_DIR>/YYYY-MM-DD/IMG_0014 helicon.jpg   (only with --render-helicon)
+<SINGLES_DIR>/YYYY-MM-DD/IMG_0067.CR3 ...  CR3s belonging to no stack, copied as-is
+```
+
+Each stack gets its own folder, named after its composite JPG, so that
+Helicon Focus's batch "Add folders" mode can be pointed at the dated folder
+and consume the whole tree directly - one render per subfolder, with nothing
+to sort out by hand first.
+
+The `YYYY-MM-DD` folder is chosen from EXIF `DateTimeOriginal`, not filesystem
+modification time. This is a deliberate difference from every other mode in
+Stackcopy, all of which date by mtime: mtime does not survive a file copy the
+way EXIF capture time does, so a Canon stack dated by mtime would land under
+whatever date the copy happened to run on rather than the date the photo was
+taken.
+
+Loose CR3s that belong to no stack default to a **sibling** of `DEST_DIR`
+(a `Single Images` folder next to it), never a folder inside it, and
+`--singles-dir` can point that elsewhere but should not point it inside
+`DEST_DIR` either. This matters because Helicon's recursive "Add folders"
+import would otherwise walk into the singles folder along with the real
+stack folders and try to render a composite out of a pile of unrelated CR3s.
 
 ## Real-world examples
 
@@ -317,6 +455,33 @@ Done. Imported 342 files in 18.4s. Breakdown: 12 stacks (12 stacked outputs, 96 
 The prefix also applies to stacked outputs in `--lightroom` and
 `--lightroomimport`.
 
+### Import a Canon focus-stack card
+
+You shot a series of in-camera depth-composite stacks on an EOS R6 Mark II
+and want the CR3 frames converted to DNG, grouped one folder per stack, with
+loose non-stack shots kept out of the way:
+
+```bash
+# Preview first
+./stackcopy.py --canon-import "/Volumes/EOS_DIGITAL/DCIM/108EOSR6" ~/Pictures/Stacked --dry --verbose
+
+# Then run it, converting up to 4 stacks in parallel
+./stackcopy.py --canon-import "/Volumes/EOS_DIGITAL/DCIM/108EOSR6" ~/Pictures/Stacked \
+    --singles-dir ~/Pictures/Singles --dng-jobs 4 --verbose
+```
+
+A completed stack folder holds each frame as a `.dng` plus the camera's own
+composite JPG for reference. Re-running the same command after an interruption
+skips any stack whose DNGs already exist, so it's safe to stop and resume.
+
+Add `--render-helicon` to also produce a `.jpg` render of each stack next to
+its folder, without opening Helicon Focus by hand:
+
+```bash
+./stackcopy.py --canon-import "/Volumes/EOS_DIGITAL/DCIM/108EOSR6" ~/Pictures/Stacked \
+    --render-helicon --verbose
+```
+
 ### Debug stack detection
 
 If stacks aren't being detected correctly:
@@ -336,6 +501,7 @@ This shows which files are being considered, timestamp gaps between frames, why 
 - `--stackcopy [DIR]` - Copy to a "stacked" subfolder with renamed files
 - `--lightroom [DIR]` - Move stack inputs to a dated folder, rename outputs in place
 - `--lightroomimport [DIR]` - Full recursive import: plans all moves, then executes oldest-first
+- `--canon-import SRC_DIR DEST_DIR` - Import Canon in-camera depth-composite stacks, converting CR3 frames to DNG
 
 ### Date filters
 
@@ -358,6 +524,16 @@ Date filters work with all modes and use filesystem modification dates. In `--li
 - `--debug-stacks` / `--debugstacks` - Show detailed diagnostics for stack detection
 - `--no-stack-detection` - Import Lightroom-mode files without automatic stack sorting
 - `--version` - Show the installed Stackcopy version
+
+### `--canon-import` options
+
+These only apply with `--canon-import` and error out if used with any other mode.
+
+- `--singles-dir DIR` - Where loose CR3s that belong to no stack are copied (default: a `Single Images` folder beside `DEST_DIR`)
+- `--dng-jobs N` - Convert N stacks' worth of frames to DNG in parallel (default: 1)
+- `--no-dng` - Copy CR3 frames as-is instead of converting them to DNG; skips Adobe DNG Converter discovery and the preflight check entirely
+- `--render-helicon` - After importing, render each stack with Helicon Focus to `<stack> helicon.jpg` beside its folder
+- `--helicon-method {0,1,2}` - Helicon rendering method A/B/C (default: `2`, method C)
 
 ## Stack detection in Lightroom modes
 
@@ -486,6 +662,47 @@ Set `STACKCOPY_EXIFTOOL=/path/to/exiftool` to point Stackcopy at a specific
 build; a packaged app otherwise prefers the one it shipped with, and everything
 else uses `PATH`.
 
+## Adobe DNG Converter and Helicon Focus
+
+These two are only needed for `--canon-import`, and neither is bundled.
+
+**Adobe DNG Converter, version 15.1 or newer**, converts each stack's CR3
+frames to DNG so they can be restacked in other software. Stackcopy looks for
+it in this order: the `STACKCOPY_DNG_CONVERTER` environment variable, then the
+standard install location for your platform (`C:\Program Files\Adobe\Adobe DNG
+Converter\` on Windows, `/Applications/Adobe DNG Converter.app` on macOS),
+then `PATH`. Download it from
+<https://helpx.adobe.com/camera-raw/using/adobe-dng-converter.html>.
+
+15.1 is called out because that is the release that added Camera Raw support
+for the EOS R6 Mark II, but the real number to internalize is that **raw
+support is per-camera-model, not per-format**: the converter carries a
+decoding profile for each camera body it understands, not a generic "CR3
+reader." A converter that predates your camera cannot read its files no
+matter how new the container format is. Because of that, a bare version
+check cannot prove a converter will work, so Stackcopy always runs one real
+trial conversion on an actual frame before importing anything. If that fails,
+the import stops immediately with an explanation, rather than failing partway
+through a large import.
+
+Pass `--no-dng` to skip conversion entirely and copy CR3 frames as-is; this
+also skips converter discovery and the preflight check, since there is
+nothing for either to check. Conversion runs once per stack folder, not once
+per file. A stack whose DNGs already exist is skipped, so an interrupted
+`--canon-import` run can simply be repeated; a stack that fails to convert is
+reported and skipped, and every other stack still proceeds.
+
+**Helicon Focus**, needed only with `--render-helicon`, renders each stack
+into a finished `.jpg`. Stackcopy looks for it via the `STACKCOPY_HELICON`
+environment variable, then the standard install location for your platform;
+there is no `PATH` fallback. Rendering uses Helicon's default method C
+(`--helicon-method 2`; pass `0` or `1` for methods A or B). Stackcopy hands
+Helicon an explicit list of frame files rather than pointing it at the stack
+folder, because that folder also holds the camera's own composite JPG, which
+must never be treated as one of the raw inputs to a fresh render. An existing
+render is left alone, so an interrupted run resumes without redoing finished
+stacks.
+
 ## Safety and recovery
 
 stackcopy is designed to be cautious:
@@ -555,8 +772,8 @@ If you run stackcopy inside WSL against files under `/mnt/c/`, `/mnt/d/`, etc., 
 
 ## Version
 
-- **Version**: 1.6.0
-- **Date**: August 24, 2026
+- **Version**: 1.7.0
+- **Date**: September 10, 2026
 - **Author**: Alan Rockefeller
 - **Repository**: https://github.com/AlanRockefeller/stackcopy
 - **License**: MIT
