@@ -2952,6 +2952,123 @@ def read_canon_stack_metadata(paths: list[str]) -> list["canon_stacks.CanonFrame
     return canon_stacks.records_from_exiftool_json(collected)
 
 
+@dataclass(frozen=True)
+class CanonPlannedStack:
+    """One focus stack, mapped onto a single destination folder."""
+
+    dest_dir: str
+    jpg_src: str
+    jpg_dest: str
+    frame_sources: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CanonImportPlan:
+    """The full mapping of a --canon-import scan onto destination paths.
+
+    ``singles`` and ``single_sources`` are parallel tuples: ``singles[i]``
+    is the planned destination for the loose CR3 whose source path is
+    ``single_sources[i]``. Kept as two tuples of plain strings, rather than
+    a tuple of pairs, so callers that only need one side are not forced to
+    unpack -- most callers only care about the destination.
+    """
+
+    stacks: tuple[CanonPlannedStack, ...]
+    singles: tuple[str, ...]
+    single_sources: tuple[str, ...] = ()
+    unresolved: tuple = ()
+
+
+def _canon_record_date(record: "canon_stacks.CanonFrame") -> str:
+    """Dated by EXIF DateTimeOriginal, which survives a copy; mtime does not."""
+    if record.timestamp is None:
+        return "unknown-date"
+    return datetime.fromtimestamp(record.timestamp).strftime("%Y-%m-%d")
+
+
+def _canon_group_date(group: "canon_stacks.CanonStackGroup") -> str:
+    """Dated by the composite JPG's own timestamp, falling back to a frame's."""
+    if group.output_jpg.timestamp is not None:
+        return _canon_record_date(group.output_jpg)
+    for frame in group.frames:
+        if frame.timestamp is not None:
+            return _canon_record_date(frame)
+    return "unknown-date"
+
+
+def build_canon_import_plan(
+    records: list["canon_stacks.CanonFrame"],
+    dest_root: str,
+    singles_root: str,
+    source_root: str = "",
+) -> CanonImportPlan:
+    """Map grouped Canon stacks onto destination folders.
+
+    One folder per stack, named for the composite JPG, so Helicon Focus
+    batch mode can consume the tree directly. CR3s belonging to no stack
+    ("singles") are planned into a *sibling* root, never inside dest_root:
+    if they lived under it, Helicon's "Add folders" recursion would treat
+    the singles folder as a stack and render garbage from it. Dated by EXIF
+    DateTimeOriginal rather than filesystem mtime, because detection already
+    reads DateTimeOriginal and mtime does not survive a copy.
+
+    A cadence-only group (canon_stacks.CONFIDENCE_CADENCE: no frame's
+    timestamp matched the composite's, so the boundary was guessed from
+    shot spacing) is too weak to auto-create an import folder for, so it is
+    reported via ``unresolved`` instead of ``stacks``. Its frames are still
+    claimed, though: they are part of *some* burst, not stray loose shots,
+    so leaving them unclaimed would misfile them as singles.
+    """
+    import canon_stacks
+
+    groups = canon_stacks.group_canon_stacks(records)
+
+    def source_path(frame: "canon_stacks.CanonFrame") -> str:
+        return os.path.join(source_root, frame.folder, frame.name)
+
+    stacks: list[CanonPlannedStack] = []
+    unresolved: list["canon_stacks.CanonStackGroup"] = []
+    claimed_sources: set[str] = set()
+    for group in groups:
+        frame_sources = tuple(source_path(frame) for frame in group.frames)
+        jpg_src = source_path(group.output_jpg)
+        claimed_sources.update(frame_sources)
+        claimed_sources.add(jpg_src)
+        if group.confidence == canon_stacks.CONFIDENCE_CADENCE:
+            unresolved.append(group)
+            continue
+        stem = os.path.splitext(group.output_jpg.name)[0]
+        dest_dir = os.path.join(dest_root, _canon_group_date(group), stem)
+        stacks.append(
+            CanonPlannedStack(
+                dest_dir=dest_dir,
+                jpg_src=jpg_src,
+                jpg_dest=os.path.join(dest_dir, group.output_jpg.name),
+                frame_sources=frame_sources,
+            )
+        )
+
+    singles: list[str] = []
+    single_sources: list[str] = []
+    for record in records:
+        if record.ext != canon_stacks.RAW_EXT:
+            continue
+        source = source_path(record)
+        if source in claimed_sources:
+            continue
+        singles.append(
+            os.path.join(singles_root, _canon_record_date(record), record.name)
+        )
+        single_sources.append(source)
+
+    return CanonImportPlan(
+        stacks=tuple(stacks),
+        singles=tuple(singles),
+        single_sources=tuple(single_sources),
+        unresolved=tuple(unresolved),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the Stackcopy command-line argument parser.
 
@@ -3020,6 +3137,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Same as --lightroom, but scans recursively and moves remaining photos and videos to a dated directory structure "
             f"under the user's Pictures directory (default: {os.path.join(_default_pictures_dir(), 'Lightroom')}/YEAR/DATE/). "
             "The destination can be overridden via the STACKCOPY_LIGHTROOM_IMPORT_DIR environment variable."
+        ),
+    )
+
+    # Canon in-camera focus-stack import mode - source and destination
+    mode_group.add_argument(
+        "--canon-import",
+        nargs=2,
+        metavar=("SRC_DIR", "DEST_DIR"),
+        help=(
+            "Import Canon in-camera depth-composite stacks: one folder per "
+            "stack, source CR3 frames converted to DNG for restacking. The "
+            "card is never modified."
         ),
     )
 
@@ -3125,6 +3254,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--singles-dir",
+        metavar="DIR",
+        help=(
+            "Where CR3 files that belong to no stack are copied "
+            "(default: a 'Single Images' folder beside DEST_DIR). Kept "
+            "outside DEST_DIR so Helicon Focus batch mode does not treat it "
+            "as a stack."
+        ),
+    )
+    parser.add_argument(
+        "--dng-jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Convert N stacks in parallel (default: 1).",
+    )
+    parser.add_argument(
+        "--no-dng",
+        action="store_true",
+        help="Copy CR3 frames as-is instead of converting them to DNG.",
+    )
+
     return parser
 
 
@@ -3199,6 +3351,15 @@ def main():
         plan_json_stdout = sys.stdout
         sys.stdout = sys.stderr
 
+    if args.singles_dir and not args.canon_import:
+        parser.error("--singles-dir can only be used with --canon-import.")
+    if args.dng_jobs != 1 and not args.canon_import:
+        parser.error("--dng-jobs can only be used with --canon-import.")
+    if args.no_dng and not args.canon_import:
+        parser.error("--no-dng can only be used with --canon-import.")
+    if args.dng_jobs < 1:
+        parser.error("--dng-jobs must be at least 1.")
+
     if args.debug_stacks:
         print(f"Running Stackcopy from: {os.path.abspath(__file__)}")
 
@@ -3255,6 +3416,7 @@ def main():
         and args.stackcopy is None
         and args.lightroom is None
         and args.lightroomimport is None
+        and not args.canon_import
     ):
         parser.print_help()
         sys.exit(1)
@@ -3362,6 +3524,59 @@ def main():
             except OSError as e:
                 print(f"Error creating stack input directory '{STACK_INPUT_DIR}': {e}")
                 sys.exit(1)
+    elif args.canon_import:  # --canon-import mode
+        # Planning only: --canon-import's execution (copying frames,
+        # converting to DNG) is wired up separately. This scans, groups, and
+        # reports the plan without writing anything, so the card is never
+        # modified by running this mode.
+        import canon_stacks
+
+        operation_mode = "canon-import"
+        source_dir = normalize_path(args.canon_import[0])
+        dest_dir = normalize_path(args.canon_import[1])
+
+        if not os.path.isdir(source_dir):
+            print(
+                f"Error: Directory '{source_dir}' does not exist or is not a directory."
+            )
+            sys.exit(1)
+
+        singles_dir = normalize_path(
+            args.singles_dir
+            or os.path.join(os.path.dirname(dest_dir), "Single Images")
+        )
+
+        scan_exts = (canon_stacks.RAW_EXT, *canon_stacks.JPG_EXTS)
+        paths = [
+            os.path.join(root, name)
+            for root, _dirs, names in os.walk(source_dir)
+            for name in names
+            if os.path.splitext(name)[1].lower() in scan_exts
+        ]
+        if not paths:
+            print(f"No Canon files found in '{display_path(source_dir)}'.")
+            sys.exit(0)
+
+        records = read_canon_stack_metadata(paths)
+        plan = build_canon_import_plan(records, dest_dir, singles_dir, source_dir)
+
+        frame_total = sum(len(stack.frame_sources) for stack in plan.stacks)
+        print(
+            f"{len(plan.stacks)} stack(s), {frame_total} frame(s), "
+            f"{len(plan.singles)} loose CR3 file(s)."
+        )
+        if plan.unresolved:
+            print(
+                f"{len(plan.unresolved)} composite(s) could not be grouped "
+                "with confidence and were left unresolved."
+            )
+        if args.verbose:
+            for stack in plan.stacks:
+                print(
+                    f"  {display_path(stack.dest_dir)}  "
+                    f"{len(stack.frame_sources)} frame(s)"
+                )
+        sys.exit(0)
     else:  # --stackcopy mode
         operation_mode = "stackcopy"
         work_dir = normalize_path(args.stackcopy)
