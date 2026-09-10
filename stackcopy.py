@@ -20,6 +20,7 @@ import re
 import errno
 import json
 import subprocess
+import dng_converter
 from urllib.parse import quote
 from bisect import bisect_left
 from collections import defaultdict
@@ -3134,6 +3135,251 @@ def build_canon_import_plan(
     )
 
 
+def _canon_scan_targets(source_dir: str) -> tuple[str, dict[str, str]]:
+    """Resolve the scan root and the camera folder(s) to import from it.
+
+    ``source_dir`` may itself be one camera folder (e.g. ``.../108EOSR6``,
+    the shape the user actually points --canon-import at) or a DCIM-style
+    root containing several. Either way the returned ``source_root`` is the
+    directory such that ``source_root/<folder>/<name>`` reproduces the real
+    path of every scanned file -- both for these targets and for the
+    adjacent context folder located below, which must be found as a
+    *sibling* of the lowest-numbered target.
+    """
+    import canon_stacks
+
+    normalized = os.path.normpath(source_dir)
+    basename = os.path.basename(normalized)
+    if canon_stacks.CAMERA_FOLDER_REGEX.match(basename):
+        return os.path.dirname(normalized), {basename: source_dir}
+
+    targets: dict[str, str] = {}
+    try:
+        with os.scandir(source_dir) as entries:
+            for entry in entries:
+                if entry.is_dir() and canon_stacks.CAMERA_FOLDER_REGEX.match(
+                    entry.name
+                ):
+                    targets[entry.name] = entry.path
+    except OSError:
+        pass
+    return source_dir, targets
+
+
+def _canon_context_folder(
+    source_root: str, target_folders: dict[str, str]
+) -> tuple[str, str] | None:
+    """The numerically-adjacent previous camera folder, as (name, path).
+
+    Canon rolls from IMG_9999 into IMG_0001 in a NEW camera folder, so a
+    burst can span that boundary; only the folder immediately below the
+    lowest-numbered target can hold the other half of such a stack. A
+    candidate that is already one of the targets is not "context" -- it is
+    already being scanned and planned as a target in its own right.
+    """
+    import canon_stacks
+
+    if not target_folders:
+        return None
+    lowest_name = min(
+        target_folders,
+        key=lambda name: int(canon_stacks.CAMERA_FOLDER_REGEX.match(name).group(1)),
+    )
+    match = canon_stacks.CAMERA_FOLDER_REGEX.match(lowest_name)
+    number, tag = int(match.group(1)), match.group(2)
+    if number <= 0:
+        return None
+    candidate_name = f"{number - 1:03d}{tag}"
+    if candidate_name in target_folders:
+        return None
+    candidate_path = os.path.join(source_root, candidate_name)
+    if os.path.isdir(candidate_path):
+        return candidate_name, candidate_path
+    return None
+
+
+def _scan_canon_files(folder_path: str) -> list[str]:
+    """List CR3/JPG files under one camera folder."""
+    import canon_stacks
+
+    scan_exts = (canon_stacks.RAW_EXT, *canon_stacks.JPG_EXTS)
+    try:
+        return [
+            os.path.join(root, name)
+            for root, _dirs, names in os.walk(folder_path)
+            for name in names
+            if os.path.splitext(name)[1].lower() in scan_exts
+        ]
+    except OSError:
+        return []
+
+
+def run_canon_import(args) -> int:
+    """Execute --canon-import: scan, plan, preflight, copy, convert, report.
+
+    Order matters: the plan is built and reported before anything is
+    touched, the converter is preflighted before any file is written (a
+    converter that cannot read this camera must fail in the first second,
+    not at hour three of a 65 GB import), and a dry run stops right after
+    that preflight, having written nothing. The card is never modified --
+    every operation below is a copy, never a move or delete of anything
+    under source_dir.
+
+    ``build_canon_import_plan`` is always called, even when nothing at all
+    was scanned, so the reported plan is always the actual authority on
+    what happens next (a caller substituting its own plan via monkeypatch
+    still gets a faithful run).
+    """
+    source_dir = normalize_path(args.canon_import[0])
+    dest_dir = normalize_path(args.canon_import[1])
+    singles_dir = normalize_path(
+        args.singles_dir or os.path.join(os.path.dirname(dest_dir), "Single Images")
+    )
+
+    source_root, target_folders = _canon_scan_targets(source_dir)
+
+    paths: list[str] = []
+    for folder_path in target_folders.values():
+        paths.extend(_scan_canon_files(folder_path))
+
+    context = _canon_context_folder(source_root, target_folders)
+    if context is not None:
+        context_name, context_path = context
+        context_paths = _scan_canon_files(context_path)
+        if context_paths:
+            print(
+                f"Including adjacent folder '{context_name}' as context "
+                f"({len(context_paths)} file(s)): a stack may span the "
+                "camera's folder rollover."
+            )
+            paths.extend(context_paths)
+
+    records = read_canon_stack_metadata(paths)
+    plan = build_canon_import_plan(
+        records, dest_dir, singles_dir, source_root,
+        target_folders=set(target_folders),
+    )
+
+    frame_total = sum(len(stack.frame_sources) for stack in plan.stacks)
+    print(
+        f"{len(plan.stacks)} stack(s), {frame_total} frame(s), "
+        f"{len(plan.singles)} loose CR3 file(s)."
+    )
+    if not plan.stacks and not plan.singles and not plan.unresolved:
+        print(f"No Canon files found under '{display_path(source_dir)}'.")
+    if plan.unresolved:
+        print(f"{len(plan.unresolved)} composite(s) could not be grouped:")
+        for group in plan.unresolved:
+            reason = group.notes[0] if group.notes else "no frames found"
+            unresolved_src = os.path.join(
+                source_root, group.output_jpg.folder, group.output_jpg.name
+            )
+            print(f"  {display_path(unresolved_src)}: {reason}")
+    if args.verbose:
+        for stack in plan.stacks:
+            note = f"  ({'; '.join(stack.notes)})" if stack.notes else ""
+            print(
+                f"  {display_path(stack.dest_dir)}  "
+                f"{len(stack.frame_sources)} frame(s){note}"
+            )
+
+    # Preflight before anything is written: a converter that cannot read this
+    # camera must fail in the first second, not at hour three. --no-dng
+    # skips converter discovery and preflight entirely -- CR3 frames are
+    # copied as-is in that mode, so there is nothing for either to check.
+    converter = None
+    if not args.no_dng:
+        # Only stack frames are ever converted (loose CR3s are copied as-is),
+        # so the converter is only relevant -- and only preflighted -- when
+        # there is at least one frame that will actually go through it.
+        sample = next(
+            (s.frame_sources[0] for s in plan.stacks if s.frame_sources), None
+        )
+        if sample is not None:
+            converter = dng_converter.find_dng_converter()
+            if converter is None:
+                print(
+                    "Adobe DNG Converter was not found. Install it from "
+                    f"{dng_converter.DNG_CONVERTER_DOWNLOAD_URL}, set "
+                    f"{dng_converter.DNG_CONVERTER_ENV}, or pass --no-dng."
+                )
+                return 1
+            problem = dng_converter.preflight(converter, sample)
+            if problem:
+                print(problem)
+                return 1
+
+    if args.dry_run:
+        print("Dry run: nothing was copied or converted.")
+        return 0
+
+    created_dirs: set[str] = set()
+    failed_stack_dirs: set[str] = set()
+    conversion_jobs: list[tuple[str, list[str]]] = []
+
+    for stack in plan.stacks:
+        try:
+            ensure_directory_once(stack.dest_dir, created_dirs, args.dry_run)
+            jpg_ok, _ = safe_file_operation(
+                "copy", stack.jpg_src, stack.jpg_dest, "copying",
+                args.force, args.dry_run,
+            )
+            if not jpg_ok:
+                failed_stack_dirs.add(stack.dest_dir)
+            if converter is not None:
+                conversion_jobs.append((stack.dest_dir, list(stack.frame_sources)))
+            else:
+                for source in stack.frame_sources:
+                    frame_ok, _ = safe_file_operation(
+                        "copy", source,
+                        os.path.join(stack.dest_dir, os.path.basename(source)),
+                        "copying", args.force, args.dry_run,
+                    )
+                    if not frame_ok:
+                        failed_stack_dirs.add(stack.dest_dir)
+        except Exception as error:
+            # A failed group must never abort the run: report it and move on
+            # to the rest of the import.
+            failed_stack_dirs.add(stack.dest_dir)
+            print(f"  Failed: {display_path(stack.dest_dir)}: {error}")
+
+    if converter is not None and conversion_jobs:
+        results = dng_converter.convert_groups(
+            converter, conversion_jobs, workers=args.dng_jobs,
+        )
+        for result in results:
+            if not result.ok:
+                failed_stack_dirs.add(result.dest_dir)
+                print(f"  Failed: {display_path(result.dest_dir)}: {result.error}")
+
+    # Loose CR3s: copied as-is, never converted -- they belong to no stack,
+    # so there is nothing to build a DNG for restacking from.
+    failed_singles = 0
+    for source, dest in zip(plan.single_sources, plan.singles):
+        try:
+            ensure_directory_once(os.path.dirname(dest), created_dirs, args.dry_run)
+            single_ok, _ = safe_file_operation(
+                "copy", source, dest, "copying", args.force, args.dry_run,
+            )
+            if not single_ok:
+                failed_singles += 1
+        except Exception as error:
+            failed_singles += 1
+            print(f"  Failed: {display_path(dest)}: {error}")
+
+    stack_failures = len(failed_stack_dirs)
+    print(
+        f"Done. {len(plan.stacks) - stack_failures} stack(s) written, "
+        f"{stack_failures} failed."
+    )
+    if plan.singles:
+        print(
+            f"{len(plan.singles) - failed_singles} loose CR3 file(s) copied, "
+            f"{failed_singles} failed."
+        )
+    return 1 if (stack_failures or failed_singles) else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the Stackcopy command-line argument parser.
 
@@ -3597,62 +3843,10 @@ def main():
                 print(f"Error creating stack input directory '{STACK_INPUT_DIR}': {e}")
                 sys.exit(1)
     elif args.canon_import:  # --canon-import mode
-        # Planning only: --canon-import's execution (copying frames,
-        # converting to DNG) is wired up separately. This scans, groups, and
-        # reports the plan without writing anything, so the card is never
-        # modified by running this mode.
-        import canon_stacks
-
-        operation_mode = "canon-import"
-        source_dir = normalize_path(args.canon_import[0])
-        dest_dir = normalize_path(args.canon_import[1])
-
-        if not os.path.isdir(source_dir):
-            print(
-                f"Error: Directory '{source_dir}' does not exist or is not a directory."
-            )
-            sys.exit(1)
-
-        singles_dir = normalize_path(
-            args.singles_dir
-            or os.path.join(os.path.dirname(dest_dir), "Single Images")
-        )
-
-        scan_exts = (canon_stacks.RAW_EXT, *canon_stacks.JPG_EXTS)
-        paths = [
-            os.path.join(root, name)
-            for root, _dirs, names in os.walk(source_dir)
-            for name in names
-            if os.path.splitext(name)[1].lower() in scan_exts
-        ]
-        if not paths:
-            print(f"No Canon files found in '{display_path(source_dir)}'.")
-            sys.exit(0)
-
-        records = read_canon_stack_metadata(paths)
-        plan = build_canon_import_plan(records, dest_dir, singles_dir, source_dir)
-
-        frame_total = sum(len(stack.frame_sources) for stack in plan.stacks)
-        print(
-            f"{len(plan.stacks)} stack(s), {frame_total} frame(s), "
-            f"{len(plan.singles)} loose CR3 file(s)."
-        )
-        if plan.unresolved:
-            print(f"{len(plan.unresolved)} composite(s) could not be grouped:")
-            for group in plan.unresolved:
-                reason = group.notes[0] if group.notes else "no frames found"
-                unresolved_src = os.path.join(
-                    source_dir, group.output_jpg.folder, group.output_jpg.name
-                )
-                print(f"  {display_path(unresolved_src)}: {reason}")
-        if args.verbose:
-            for stack in plan.stacks:
-                note = f"  ({'; '.join(stack.notes)})" if stack.notes else ""
-                print(
-                    f"  {display_path(stack.dest_dir)}  "
-                    f"{len(stack.frame_sources)} frame(s){note}"
-                )
-        sys.exit(0)
+        # Fully self-contained: scans, plans, preflights, and executes on
+        # its own, then exits -- none of the shared copy/rename/lightroom
+        # machinery below applies to it.
+        sys.exit(run_canon_import(args))
     else:  # --stackcopy mode
         operation_mode = "stackcopy"
         work_dir = normalize_path(args.stackcopy)

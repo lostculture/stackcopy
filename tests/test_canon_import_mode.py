@@ -164,3 +164,238 @@ def test_unresolved_composite_is_named_and_not_double_counted_into_singles():
     assert [g.output_jpg.name for g in plan.unresolved] == ["IMG_0400.JPG"]
     singles = [Path(p).name for p in plan.singles]
     assert singles == ["IMG_0401.CR3"]
+
+
+# --- Task 9: run_canon_import (execution, dry-run, preflight wiring) -------
+
+
+def test_dry_run_writes_nothing_and_reports_groups(plan, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
+    )
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "preflight", lambda *a, **k: None
+    )
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"), "--dry"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "101" in output
+    assert not (tmp_path / "dst").exists()
+
+
+def test_no_dng_skips_the_converter_entirely(tmp_path, monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "find_dng_converter",
+        lambda: called.append("looked") or None,
+    )
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--no-dng", "--dry"]
+    )
+    (tmp_path / "src").mkdir()
+    stackcopy.run_canon_import(args)
+    assert called == []
+
+
+def test_import_refuses_when_converter_cannot_read_the_camera(
+    tmp_path, monkeypatch, capsys
+):
+    """A converter that fails its trial conversion must stop before any write.
+
+    Deliberately not the brief's original draft of this test (a totally
+    empty source directory). Preflight is only meaningful -- and, in this
+    implementation, only run -- when there is an actual frame to sample; an
+    empty scan produces an empty plan with no frame at all, so it would
+    never reach the converter and the test would fail for a reason that has
+    nothing to do with what it is meant to guard. This uses a real
+    one-frame stack instead, so preflight is exercised by the ordinary
+    scan-plan-preflight path.
+    """
+    src = tmp_path / "src" / "100EOSR6"
+    src.mkdir(parents=True)
+    (src / "IMG_0001.CR3").write_bytes(b"frame")
+    (src / "IMG_0002.JPG").write_bytes(b"composite")
+
+    records = [
+        canon_stacks.CanonFrame("100EOSR6", 1, ".cr3", "IMG_0001.CR3"),
+        canon_stacks.CanonFrame(
+            "100EOSR6", 2, ".jpg", "IMG_0002.JPG", depth_composite=True
+        ),
+    ]
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: records)
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
+    )
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "preflight",
+        lambda *a, **k: "Adobe DNG Converter (13.0) could not convert IMG_0001.CR3",
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(src), str(tmp_path / "dst")]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+    output = capsys.readouterr().out
+
+    assert exit_code != 0
+    assert "13.0" in output
+    assert not (tmp_path / "dst").exists()
+
+
+def test_loose_cr3s_are_actually_copied_not_merely_planned(tmp_path, monkeypatch):
+    """R2 regression: a single must be copied, not merely have its folder made.
+
+    The brief's original draft called ensure_directory_once on each single's
+    destination directory and stopped there -- it would create an empty
+    folder and silently leave the CR3 itself uncopied. Asserting on the
+    destination *file's* bytes (not just the directory's existence) is what
+    makes this test actually catch that.
+    """
+    single_src = tmp_path / "src" / "100EOSR6" / "IMG_0005.CR3"
+    single_src.parent.mkdir(parents=True)
+    single_src.write_bytes(b"loose-frame-bytes")
+
+    single_dest = tmp_path / "dst" / "Single Images" / "2026-01-01" / "IMG_0005.CR3"
+    fake_plan = stackcopy.CanonImportPlan(
+        stacks=(),
+        singles=(str(single_dest),),
+        single_sources=(str(single_src),),
+        unresolved=(),
+    )
+    monkeypatch.setattr(
+        stackcopy, "build_canon_import_plan", lambda *a, **k: fake_plan
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(single_src.parent), str(tmp_path / "dst")]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+
+    assert exit_code == 0
+    assert single_dest.exists(), (
+        "the single's destination folder must contain the file itself, "
+        "not merely exist"
+    )
+    assert single_dest.read_bytes() == b"loose-frame-bytes"
+
+
+def test_no_dng_execution_copies_composite_frame_and_single(tmp_path, monkeypatch):
+    """End-to-end --no-dng run: real bytes land for the JPG, frame, and single.
+
+    --no-dng means CR3 frames are copied into the stack folder rather than
+    converted, and it must skip converter discovery/preflight entirely.
+    """
+    src = tmp_path / "src" / "100EOSR6"
+    src.mkdir(parents=True)
+    (src / "IMG_0001.CR3").write_bytes(b"frame-one")
+    (src / "IMG_0002.JPG").write_bytes(b"composite-two")
+    (src / "IMG_0003.CR3").write_bytes(b"loose-three")
+
+    records = [
+        canon_stacks.CanonFrame("100EOSR6", 1, ".cr3", "IMG_0001.CR3"),
+        canon_stacks.CanonFrame(
+            "100EOSR6", 2, ".jpg", "IMG_0002.JPG", depth_composite=True
+        ),
+        canon_stacks.CanonFrame("100EOSR6", 3, ".cr3", "IMG_0003.CR3"),
+    ]
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: records)
+
+    called = []
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "find_dng_converter",
+        lambda: called.append("looked") or None,
+    )
+
+    dest = tmp_path / "dst"
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(src), str(dest), "--no-dng"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+
+    assert exit_code == 0
+    assert called == []  # --no-dng: converter never even looked for
+
+    stack_dir = dest / "unknown-date" / "IMG_0002"
+    assert (stack_dir / "IMG_0002.JPG").read_bytes() == b"composite-two"
+    assert (stack_dir / "IMG_0001.CR3").read_bytes() == b"frame-one"
+
+    single_dest = tmp_path / "Single Images" / "unknown-date" / "IMG_0003.CR3"
+    assert single_dest.read_bytes() == b"loose-three"
+
+
+def test_adjacent_previous_camera_folder_is_scanned_as_context(
+    tmp_path, monkeypatch, capsys
+):
+    """R21: importing 108EOSR6 must also scan the sibling 107EOSR6 for context.
+
+    107EOSR6 is not itself an import target (a stack spanning the folder
+    rollover must be able to borrow its frames, but it must never become a
+    target of its own -- see build_canon_import_plan's target_folders
+    contract, already covered elsewhere). This test is about run_canon_import's
+    own responsibility: finding that sibling folder, scanning it, and telling
+    build_canon_import_plan the right target set -- so it is a spy on that
+    call rather than a re-test of canon_stacks' grouping algorithm.
+    """
+    root = tmp_path / "DCIM"
+    previous_folder = root / "107EOSR6"
+    target_folder = root / "108EOSR6"
+    previous_folder.mkdir(parents=True)
+    target_folder.mkdir()
+    (previous_folder / "IMG_9999.CR3").write_bytes(b"tail-frame")
+    (target_folder / "IMG_0001.JPG").write_bytes(b"composite")
+
+    captured = {}
+
+    def spy_build_plan(records, dest_root, singles_root, source_root="",
+                        target_folders=None):
+        captured["folders"] = {r.folder for r in records}
+        captured["target_folders"] = target_folders
+        return stackcopy.CanonImportPlan(
+            stacks=(), singles=(), single_sources=(), unresolved=()
+        )
+
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", spy_build_plan)
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(target_folder), str(tmp_path / "dst"),
+         "--no-dng", "--dry"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert captured["target_folders"] == {"108EOSR6"}
+    assert captured["folders"] == {"107EOSR6", "108EOSR6"}
+    assert "107EOSR6" in output, "context being pulled in must be visible"
+
+
+def test_no_adjacent_folder_proceeds_normally(tmp_path, monkeypatch, capsys):
+    """No previous sibling folder on the card: nothing extra is scanned."""
+    target_folder = tmp_path / "DCIM" / "200EOSR6"
+    target_folder.mkdir(parents=True)
+    (target_folder / "IMG_0001.CR3").write_bytes(b"solo-frame")
+
+    captured = {}
+
+    def spy_build_plan(records, dest_root, singles_root, source_root="",
+                        target_folders=None):
+        captured["folders"] = {r.folder for r in records}
+        return stackcopy.CanonImportPlan(
+            stacks=(), singles=(), single_sources=(), unresolved=()
+        )
+
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", spy_build_plan)
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(target_folder), str(tmp_path / "dst"),
+         "--no-dng", "--dry"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+
+    assert exit_code == 0
+    assert captured["folders"] == {"200EOSR6"}
