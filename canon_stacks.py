@@ -311,6 +311,16 @@ def _extend_across_folder(
 
 
 def group_canon_stacks(records: list[CanonFrame]) -> list[CanonStackGroup]:
+    """Match each in-camera composite JPG to the frames that produced it.
+
+    A composite is recognised by its Canon ``FocusBracketingDepthComposite``
+    tag and cut from the preceding run of CR3s at the frame whose timestamp it
+    shares - the anchor, which is exact.  Where no frame matches, the run is
+    cut on cadence instead, and a burst that spans the camera's folder
+    rollover reaches back into the previous folder.  Each group records which
+    of those three routes produced it, so a caller can tell an exact match
+    from an inferred one.
+    """
     index = _index(records)
     groups: list[CanonStackGroup] = []
     jpgs = sorted(

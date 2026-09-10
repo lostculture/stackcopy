@@ -89,6 +89,13 @@ def render_command(
     smoothing: int = DEFAULT_SMOOTHING,
     jpeg_quality: int = DEFAULT_JPEG_QUALITY,
 ) -> list[str]:
+    """Build the Helicon Focus command line for one stack.
+
+    ``-noprogress`` is not optional: plain ``-silent`` still raises a progress
+    window, which hangs a non-interactive run.  Frames arrive through
+    ``-i <file list>`` rather than as a folder because a stack folder also
+    holds the camera's own composite JPG, which must never enter the stack.
+    """
     return [
         helicon,
         "-silent",

@@ -85,7 +85,9 @@ def converter_version(path: str) -> tuple[int, int] | None:
             info = ctypes.cast(
                 block, ctypes.POINTER(ctypes.c_uint32 * 4)
             ).contents
-            most, least = info[2], info[3]
+            # info[2] is the file version's high DWORD; the low DWORD
+            # (info[3]) carries the build numbers, which we do not report.
+            most = info[2]
             return (most >> 16) & 0xFFFF, most & 0xFFFF
         except Exception:
             return None

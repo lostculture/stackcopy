@@ -20,6 +20,7 @@ import re
 import errno
 import json
 import subprocess
+import canon_stacks
 import dng_converter
 import helicon_focus
 from urllib.parse import quote
@@ -2885,7 +2886,7 @@ CANON_STACK_TAGS = (
 )
 
 
-def read_canon_stack_metadata(paths: list[str]) -> list["canon_stacks.CanonFrame"]:
+def read_canon_stack_metadata(paths: list[str]) -> list[canon_stacks.CanonFrame]:
     """Read Canon depth-composite MakerNotes in bounded ExifTool batches.
 
     Returns one canon_stacks.CanonFrame per readable camera file.  ExifTool is
@@ -2893,8 +2894,6 @@ def read_canon_stack_metadata(paths: list[str]) -> list["canon_stacks.CanonFrame
     metadata left unknown, and Canon grouping degrades to its cadence
     heuristic exactly as the Olympus path degrades to its own.
     """
-    import canon_stacks
-
     if not paths:
         return []
 
@@ -2999,13 +2998,13 @@ class CanonImportPlan:
     stacks: tuple[CanonPlannedStack, ...]
     singles: tuple[str, ...]
     single_sources: tuple[str, ...] = ()
-    unresolved: tuple["canon_stacks.CanonStackGroup", ...] = ()
+    unresolved: tuple[canon_stacks.CanonStackGroup, ...] = ()
 
 
 _CANON_EXIF_DATE_REGEX = re.compile(r"^(\d{4}):(\d{2}):(\d{2})[ T]")
 
 
-def _canon_record_date(record: "canon_stacks.CanonFrame") -> str:
+def _canon_record_date(record: canon_stacks.CanonFrame) -> str:
     """Dated by EXIF DateTimeOriginal, which survives a copy; mtime does not.
 
     Taken from ExifTool's own text, not from the parsed epoch value. The
@@ -3031,7 +3030,7 @@ def _canon_record_date(record: "canon_stacks.CanonFrame") -> str:
     return datetime.fromtimestamp(record.timestamp).strftime("%Y-%m-%d")
 
 
-def _canon_group_date(group: "canon_stacks.CanonStackGroup") -> str:
+def _canon_group_date(group: canon_stacks.CanonStackGroup) -> str:
     """Dated by the composite JPG's own timestamp, falling back to a frame's."""
     for record in (group.output_jpg, *group.frames):
         date = _canon_record_date(record)
@@ -3041,7 +3040,7 @@ def _canon_group_date(group: "canon_stacks.CanonStackGroup") -> str:
 
 
 def build_canon_import_plan(
-    records: list["canon_stacks.CanonFrame"],
+    records: list[canon_stacks.CanonFrame],
     dest_root: str,
     singles_root: str,
     source_root: str = "",
@@ -3078,14 +3077,12 @@ def build_canon_import_plan(
     ``unresolved`` is reserved for the narrower case of a target-folder
     composite for which canon_stacks could find no frames at all.
     """
-    import canon_stacks
-
     def is_target(folder: str) -> bool:
         return target_folders is None or folder in target_folders
 
     groups = canon_stacks.group_canon_stacks(records)
 
-    def source_path(frame: "canon_stacks.CanonFrame") -> str:
+    def source_path(frame: canon_stacks.CanonFrame) -> str:
         return os.path.join(source_root, frame.folder, frame.name)
 
     stacks: list[CanonPlannedStack] = []
@@ -3125,7 +3122,7 @@ def build_canon_import_plan(
         for record in records
         if record.ext == canon_stacks.RAW_EXT
     }
-    unresolved: list["canon_stacks.CanonStackGroup"] = []
+    unresolved: list[canon_stacks.CanonStackGroup] = []
     for record in records:
         if record.ext != ".jpg" or not is_target(record.folder):
             continue
@@ -3175,8 +3172,6 @@ def _canon_scan_targets(source_dir: str) -> tuple[str, dict[str, str]]:
     adjacent context folder located below, which must be found as a
     *sibling* of the lowest-numbered target.
     """
-    import canon_stacks
-
     normalized = os.path.normpath(source_dir)
     basename = os.path.basename(normalized)
     if canon_stacks.CAMERA_FOLDER_REGEX.match(basename):
@@ -3206,8 +3201,6 @@ def _canon_context_folder(
     candidate that is already one of the targets is not "context" -- it is
     already being scanned and planned as a target in its own right.
     """
-    import canon_stacks
-
     if not target_folders:
         return None
     lowest_name = min(
@@ -3229,8 +3222,6 @@ def _canon_context_folder(
 
 def _scan_canon_files(folder_path: str) -> list[str]:
     """List CR3/JPG files under one camera folder."""
-    import canon_stacks
-
     scan_exts = (canon_stacks.RAW_EXT, *canon_stacks.JPG_EXTS)
     try:
         return [
