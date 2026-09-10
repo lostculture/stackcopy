@@ -170,6 +170,71 @@ def test_unresolved_composite_is_named_and_not_double_counted_into_singles():
 # --- Task 9: run_canon_import (execution, dry-run, preflight wiring) -------
 
 
+def test_destination_date_comes_from_the_cameras_own_exif_text():
+    """Fix round 2, item 2: the date must not be re-localised.
+
+    ``record.timestamp`` is an absolute instant carrying the *camera's* UTC
+    offset. Rendering it with ``datetime.fromtimestamp`` re-expresses it in
+    the *importing machine's* timezone, so where a frame lands depends on
+    which computer you plug the card into -- a -04:00 card imported on a UTC
+    machine files everything shot after 20:00 into the next day.
+
+    These two composites are the SAME absolute instant written with two
+    different camera offsets, so ``fromtimestamp`` is guaranteed to give
+    them both the same folder no matter what timezone this test machine is
+    in. Only reading the EXIF text keeps them apart, which is what the two
+    assertions below demand: reintroducing ``fromtimestamp`` collapses them
+    onto one date and fails.
+    """
+    late = canon_stacks.CanonFrame(
+        "108EOSR6", 2, ".jpg", "IMG_0002.JPG",
+        timestamp_text="2026:07:31 23:00:00.00-04:00", depth_composite=True,
+    )
+    early = canon_stacks.CanonFrame(
+        "108EOSR6", 4, ".jpg", "IMG_0004.JPG",
+        timestamp_text="2026:08:01 05:00:00.00+02:00", depth_composite=True,
+    )
+    assert late.timestamp == early.timestamp, "same instant, different offsets"
+
+    assert stackcopy._canon_record_date(late) == "2026-07-31"
+    assert stackcopy._canon_record_date(early) == "2026-08-01"
+
+
+def test_stack_folder_is_dated_by_the_camera_not_the_importing_machine(tmp_path):
+    """The same defect, seen where it actually bites: the planned path.
+
+    Two one-frame stacks shot at the SAME absolute instant by two cameras on
+    different UTC offsets. ``datetime.fromtimestamp`` renders both in this
+    machine's timezone and therefore files them under one date, whatever
+    that date happens to be here; only the EXIF text keeps them apart. That
+    is what makes this test independent of the machine running it.
+    """
+    records = []
+    for number, text in (
+        (1, "2026:07:31 23:00:00.00-04:00"),
+        (11, "2026:08:01 05:00:00.00+02:00"),
+    ):
+        records.append(canon_stacks.CanonFrame(
+            "108EOSR6", number, ".cr3", f"IMG_{number:04d}.CR3",
+            timestamp_text=text,
+        ))
+        records.append(canon_stacks.CanonFrame(
+            "108EOSR6", number + 1, ".jpg", f"IMG_{number + 1:04d}.JPG",
+            timestamp_text=text, depth_composite=True,
+        ))
+    assert records[0].timestamp == records[2].timestamp, (
+        "the two stacks must be the same instant, or this proves nothing"
+    )
+
+    plan = stackcopy.build_canon_import_plan(
+        records, str(tmp_path / "dst"), str(tmp_path / "singles"),
+    )
+
+    assert len(plan.stacks) == 2
+    dates = {Path(s.dest_dir).parent.name for s in plan.stacks}
+    assert dates == {"2026-07-31", "2026-08-01"}
+
+
 def test_dry_run_writes_nothing_and_reports_groups(plan, tmp_path, monkeypatch, capsys):
     # The source dir must actually exist: run_canon_import now fails fast on
     # a nonexistent source path (fix round 1, item 1), and this test's intent
@@ -233,18 +298,73 @@ def test_existing_but_empty_source_directory_still_exits_zero(tmp_path, capsys):
 
 
 def test_no_dng_skips_the_converter_entirely(tmp_path, monkeypatch):
+    """--no-dng must stop converter discovery before it ever starts.
+
+    Fix round 2, item 6: this test used to point at an EMPTY source
+    directory, so the plan had no stacks, so ``sample`` was None and
+    ``find_dng_converter()`` was unreachable *regardless* of --no-dng --
+    the assertion held whether or not the gate existed. A genuine one-frame
+    stack is what makes the gate the only thing standing between this run
+    and converter discovery.
+    """
+    src = tmp_path / "src" / "100EOSR6"
+    src.mkdir(parents=True)
+    (src / "IMG_0001.CR3").write_bytes(b"frame")
+    (src / "IMG_0002.JPG").write_bytes(b"composite")
+    records = [
+        canon_stacks.CanonFrame("100EOSR6", 1, ".cr3", "IMG_0001.CR3"),
+        canon_stacks.CanonFrame(
+            "100EOSR6", 2, ".jpg", "IMG_0002.JPG", depth_composite=True
+        ),
+    ]
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: records)
+
     called = []
     monkeypatch.setattr(
         stackcopy.dng_converter, "find_dng_converter",
         lambda: called.append("looked") or None,
     )
     args = stackcopy.parse_arguments(
-        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
-         "--no-dng", "--dry"]
+        ["--canon-import", str(src), str(tmp_path / "dst"), "--no-dng", "--dry"]
     )
-    (tmp_path / "src").mkdir()
+    exit_code = stackcopy.run_canon_import(args)
+
+    assert exit_code == 0
+    assert called == [], "--no-dng must not reach converter discovery"
+
+
+def test_without_no_dng_the_same_stack_does_reach_converter_discovery(
+    tmp_path, monkeypatch
+):
+    """The control for the test above: prove the gate is what did the work.
+
+    Identical setup, --no-dng removed. If discovery is still not reached
+    here then the test above proves nothing about --no-dng.
+    """
+    src = tmp_path / "src" / "100EOSR6"
+    src.mkdir(parents=True)
+    (src / "IMG_0001.CR3").write_bytes(b"frame")
+    (src / "IMG_0002.JPG").write_bytes(b"composite")
+    records = [
+        canon_stacks.CanonFrame("100EOSR6", 1, ".cr3", "IMG_0001.CR3"),
+        canon_stacks.CanonFrame(
+            "100EOSR6", 2, ".jpg", "IMG_0002.JPG", depth_composite=True
+        ),
+    ]
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: records)
+
+    called = []
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "find_dng_converter",
+        lambda: called.append("looked") or "/fake/converter",
+    )
+    monkeypatch.setattr(stackcopy.dng_converter, "preflight", lambda *a, **k: None)
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(src), str(tmp_path / "dst"), "--dry"]
+    )
     stackcopy.run_canon_import(args)
-    assert called == []
+
+    assert called == ["looked"]
 
 
 def test_import_refuses_when_converter_cannot_read_the_camera(
@@ -545,6 +665,61 @@ def _two_stack_plan(tmp_path):
     return plan, stack_dirs
 
 
+ROLLOVER_FRAMES = ("IMG_9998", "IMG_9999", "IMG_0001", "IMG_0002")
+
+
+def _rollover_stack_plan(tmp_path):
+    """One stack spanning the camera's IMG_9999 -> IMG_0001 folder rollover.
+
+    This is not a synthetic curiosity: it is IMG_0014 on the real card, the
+    very first stack of the import. ``frame_sources`` is in CAPTURE order,
+    which is the order the focus travelled through the scene. Sorting the
+    destination names instead puts IMG_0001/IMG_0002 in front of
+    IMG_9998/IMG_9999 -- the two halves of the sweep swapped.
+    """
+    src = tmp_path / "src"
+    (src / "107EOSR6").mkdir(parents=True, exist_ok=True)
+    (src / "108EOSR6").mkdir(parents=True, exist_ok=True)
+    sources = []
+    for stem in ROLLOVER_FRAMES:
+        folder = "107EOSR6" if stem.startswith("IMG_99") else "108EOSR6"
+        path = src / folder / f"{stem}.CR3"
+        path.write_bytes(f"frame-{stem}".encode())
+        sources.append(str(path))
+    jpg = src / "108EOSR6" / "IMG_0003.JPG"
+    jpg.write_bytes(b"composite")
+    stack_dir = tmp_path / "dst" / "2026-01-01" / "IMG_0003"
+    plan = stackcopy.CanonImportPlan(
+        stacks=(
+            stackcopy.CanonPlannedStack(
+                dest_dir=str(stack_dir),
+                jpg_src=str(jpg),
+                jpg_dest=str(stack_dir / "IMG_0003.JPG"),
+                frame_sources=tuple(sources),
+            ),
+        ),
+        singles=(), single_sources=(), unresolved=(),
+    )
+    return plan, stack_dir
+
+
+def _fake_convert_groups_writing_dngs(skip=()):
+    """A convert_groups stub that writes one .dng per source, minus ``skip``."""
+    def fake(converter, jobs_by_dest, workers=1, on_progress=None):
+        results = []
+        for dest_dir, files in jobs_by_dest:
+            for source in files:
+                stem = os.path.splitext(os.path.basename(source))[0]
+                if stem in skip:
+                    continue
+                Path(dest_dir, f"{stem}.dng").write_bytes(b"fake-dng")
+            results.append(stackcopy.dng_converter.ConversionResult(
+                dest_dir, converted=len(files)
+            ))
+        return results
+    return fake
+
+
 def test_render_helicon_missing_binary_fails_clearly(tmp_path, monkeypatch, capsys):
     """A requested render with no Helicon install must fail loudly, not skip.
 
@@ -677,9 +852,114 @@ def test_render_helicon_uses_raw_frames_when_no_dng(tmp_path, monkeypatch):
     assert captured["frames"] == [str(stack_dir / "IMG_0001.CR3")]
 
 
-def test_render_helicon_uses_dng_frames_after_conversion(tmp_path, monkeypatch):
-    """When conversion ran, Helicon must render the produced DNGs, not CR3s."""
-    plan, stack_dir = _one_stack_plan(tmp_path)
+def test_render_helicon_uses_dng_frames_in_capture_order(tmp_path, monkeypatch):
+    """Fix round 2, item 1: the frame list is the PLAN, not a sorted listdir.
+
+    The stack spans the camera's IMG_9999 -> IMG_0001 rollover, so
+    lexicographic order and capture order genuinely differ. Helicon methods
+    A and B are order-dependent; a scrambled list still renders, still exits
+    0, and is silently wrong, which is why this is asserted as an exact
+    ordered list rather than a set. The predecessor of this test used a
+    ONE-frame stack and so could not tell the two orders apart at all.
+    """
+    plan, stack_dir = _rollover_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
+    )
+    monkeypatch.setattr(stackcopy.dng_converter, "preflight", lambda *a, **k: None)
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "convert_groups",
+        _fake_convert_groups_writing_dngs(),
+    )
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
+    )
+
+    captured = {}
+
+    def fake_render_stack(helicon, frames, output_path, method=2, **kwargs):
+        captured["frames"] = frames
+        return stackcopy.helicon_focus.RenderResult(output_path, rendered=True)
+
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "render_stack", fake_render_stack
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--render-helicon"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+
+    assert exit_code == 0
+    expected = [str(stack_dir / f"{stem}.dng") for stem in ROLLOVER_FRAMES]
+    assert captured["frames"] == expected
+    assert captured["frames"] != sorted(captured["frames"]), (
+        "the fixture must actually distinguish capture order from "
+        "lexicographic order, or this test proves nothing"
+    )
+
+
+def test_render_helicon_skips_a_stack_with_a_missing_dng(
+    tmp_path, monkeypatch, capsys
+):
+    """A short stack renders silently wrong: refuse, report, keep going.
+
+    A frame the converter never produced must not simply be absent from the
+    render. Helicon would happily blend the remaining three and exit 0, and
+    nothing downstream would ever say the result is missing a slice of the
+    focus sweep.
+    """
+    plan, stack_dir = _rollover_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
+    )
+    monkeypatch.setattr(stackcopy.dng_converter, "preflight", lambda *a, **k: None)
+    # The converter reports success for the group but one DNG never appears.
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "convert_groups",
+        _fake_convert_groups_writing_dngs(skip=("IMG_9999",)),
+    )
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
+    )
+
+    calls = []
+
+    def fake_render_stack(helicon, frames, output_path, method=2, **kwargs):
+        calls.append(frames)
+        return stackcopy.helicon_focus.RenderResult(output_path, rendered=True)
+
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "render_stack", fake_render_stack
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--render-helicon"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+    output = capsys.readouterr().out
+
+    assert calls == [], "an incomplete stack must not be rendered at all"
+    assert exit_code == 1
+    assert "IMG_9999.dng" in output
+    assert "missing" in output
+
+
+def test_render_helicon_ignores_a_stale_dng_left_by_an_earlier_run(
+    tmp_path, monkeypatch
+):
+    """A .dng from an earlier run with different grouping is not a frame.
+
+    Listing the folder would sweep it into the render; deriving the list
+    from the plan cannot see it.
+    """
+    plan, stack_dir = _rollover_stack_plan(tmp_path)
     monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
@@ -693,6 +973,8 @@ def test_render_helicon_uses_dng_frames_after_conversion(tmp_path, monkeypatch):
             for source in files:
                 stem = os.path.splitext(os.path.basename(source))[0]
                 Path(dest_dir, f"{stem}.dng").write_bytes(b"fake-dng")
+            # Debris from a previous, differently-grouped import.
+            Path(dest_dir, "IMG_5555.dng").write_bytes(b"stale-dng")
             results.append(stackcopy.dng_converter.ConversionResult(
                 dest_dir, converted=len(files)
             ))
@@ -722,7 +1004,10 @@ def test_render_helicon_uses_dng_frames_after_conversion(tmp_path, monkeypatch):
     exit_code = stackcopy.run_canon_import(args)
 
     assert exit_code == 0
-    assert captured["frames"] == [str(stack_dir / "IMG_0001.dng")]
+    assert (stack_dir / "IMG_5555.dng").exists(), "the stale file is still there"
+    assert captured["frames"] == [
+        str(stack_dir / f"{stem}.dng") for stem in ROLLOVER_FRAMES
+    ]
 
 
 def test_render_helicon_skips_a_stack_whose_copy_already_failed(
@@ -764,3 +1049,90 @@ def test_render_helicon_skips_a_stack_whose_copy_already_failed(
 
     assert len(calls) == 1, "only the healthy second stack should be rendered"
     assert stack_dirs[1].name in calls[0]
+
+
+# --- Fix round 2, item 3 / item 7 minors -----------------------------------
+
+
+def test_canon_import_runs_the_shared_low_space_check(tmp_path, monkeypatch):
+    """Every other mode calls confirm_if_low_space; --canon-import did not.
+
+    DNG output is LARGER than the CR3 input, so this is the mode most able
+    to fill a disk -- a 65 GB card at hour two. The operations handed to the
+    check must cover the composite, every stack frame and every loose CR3,
+    and each frame's entry must name where it will actually land (the .dng,
+    when conversion is on), so the estimate lands on the right filesystem.
+    """
+    plan, stack_dir = _rollover_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
+    )
+    monkeypatch.setattr(stackcopy.dng_converter, "preflight", lambda *a, **k: None)
+
+    seen = []
+    monkeypatch.setattr(
+        stackcopy, "confirm_if_low_space",
+        lambda ops, dry_run: seen.append((list(ops), dry_run)),
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"), "--dry"]
+    )
+    assert stackcopy.run_canon_import(args) == 0
+
+    assert len(seen) == 1, "the low-space check must run exactly once"
+    ops, dry_run = seen[0]
+    assert dry_run is True
+    assert all(op[2] == "copy" for op in ops)
+    sources = [op[0] for op in ops]
+    assert sources == [plan.stacks[0].jpg_src, *plan.stacks[0].frame_sources]
+    assert [op[1] for op in ops][1:] == [
+        str(stack_dir / f"{stem}.dng") for stem in ROLLOVER_FRAMES
+    ]
+
+
+def test_dng_jobs_is_clamped_to_a_sane_range(capsys):
+    """An unbounded --dng-jobs is a typo away from thousands of converters."""
+    for bad in ("0", str(stackcopy.MAX_DNG_JOBS + 1)):
+        with pytest.raises(SystemExit):
+            stackcopy.parse_arguments(
+                ["--canon-import", "src", "dst", "--dng-jobs", bad]
+            )
+        assert str(stackcopy.MAX_DNG_JOBS) in capsys.readouterr().err
+    args = stackcopy.parse_arguments(
+        ["--canon-import", "src", "dst",
+         "--dng-jobs", str(stackcopy.MAX_DNG_JOBS)]
+    )
+    assert args.dng_jobs == stackcopy.MAX_DNG_JOBS
+
+
+def test_helicon_method_default_tracks_the_module_constant():
+    """The literal 2 in the parser and in main()'s gate is now one constant."""
+    args = stackcopy.parse_arguments(["--canon-import", "src", "dst"])
+    assert args.helicon_method == stackcopy.helicon_focus.DEFAULT_METHOD
+
+
+def test_unresolved_composite_reports_all_of_its_notes(tmp_path, monkeypatch, capsys):
+    """notes[0] alone silently drops every explanation after the first."""
+    group = canon_stacks.CanonStackGroup(
+        output_jpg=canon_stacks.CanonFrame(
+            "108EOSR6", 9, ".jpg", "IMG_0009.JPG", depth_composite=True
+        ),
+        frames=(),
+        confidence="no-frames-found",
+        notes=("first reason", "second reason"),
+    )
+    plan = stackcopy.CanonImportPlan(
+        stacks=(), singles=(), single_sources=(), unresolved=(group,)
+    )
+    (tmp_path / "src").mkdir()
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"), "--dry"]
+    )
+    stackcopy.run_canon_import(args)
+    output = capsys.readouterr().out
+    assert "first reason" in output
+    assert "second reason" in output

@@ -2927,6 +2927,13 @@ def read_canon_stack_metadata(paths: list[str]) -> list["canon_stacks.CanonFrame
             degraded_files += len(batch)
             collected.extend({"SourceFile": path} for path in batch)
             continue
+        # ExifTool exits non-zero when ANY file in the batch is unreadable,
+        # while still printing complete records for every file it could
+        # read. Discarding the batch on exit status alone would degrade
+        # hundreds of good frames to filename-only -- losing exactly the
+        # composite flags grouping depends on -- because of one bad file.
+        # Parse the JSON regardless; the per-file reconciliation below is
+        # what decides which files are genuinely unknown.
         try:
             payload = json.loads(completed.stdout)
         except (json.JSONDecodeError, TypeError, ValueError):
@@ -2992,11 +2999,33 @@ class CanonImportPlan:
     stacks: tuple[CanonPlannedStack, ...]
     singles: tuple[str, ...]
     single_sources: tuple[str, ...] = ()
-    unresolved: tuple = ()
+    unresolved: tuple["canon_stacks.CanonStackGroup", ...] = ()
+
+
+_CANON_EXIF_DATE_REGEX = re.compile(r"^(\d{4}):(\d{2}):(\d{2})[ T]")
 
 
 def _canon_record_date(record: "canon_stacks.CanonFrame") -> str:
-    """Dated by EXIF DateTimeOriginal, which survives a copy; mtime does not."""
+    """Dated by EXIF DateTimeOriginal, which survives a copy; mtime does not.
+
+    Taken from ExifTool's own text, not from the parsed epoch value. The
+    parsed value is an absolute instant carrying the *camera's* UTC offset;
+    rendering it with datetime.fromtimestamp() would re-express it in the
+    *importing machine's* timezone, so importing a -04:00 card on a UTC
+    machine would file everything shot after 20:00 into the next day's
+    folder -- and a body that writes no offset at all (parsed as +00:00)
+    would be shifted by the full local offset. The date the photographer
+    saw on the camera is the one in the text, so the text is what names the
+    folder; the parsed value is only a fallback for a record that has text
+    we could not parse a date out of.
+    """
+    match = (
+        _CANON_EXIF_DATE_REGEX.match(record.timestamp_text)
+        if record.timestamp_text
+        else None
+    )
+    if match:
+        return "-".join(match.groups())
     if record.timestamp is None:
         return "unknown-date"
     return datetime.fromtimestamp(record.timestamp).strftime("%Y-%m-%d")
@@ -3004,11 +3033,10 @@ def _canon_record_date(record: "canon_stacks.CanonFrame") -> str:
 
 def _canon_group_date(group: "canon_stacks.CanonStackGroup") -> str:
     """Dated by the composite JPG's own timestamp, falling back to a frame's."""
-    if group.output_jpg.timestamp is not None:
-        return _canon_record_date(group.output_jpg)
-    for frame in group.frames:
-        if frame.timestamp is not None:
-            return _canon_record_date(frame)
+    for record in (group.output_jpg, *group.frames):
+        date = _canon_record_date(record)
+        if date != "unknown-date":
+            return date
     return "unknown-date"
 
 
@@ -3215,6 +3243,20 @@ def _scan_canon_files(folder_path: str) -> list[str]:
         return []
 
 
+def _canon_frame_dest(
+    stack: CanonPlannedStack, source: str, converted: bool
+) -> str:
+    """Where one planned frame lands: <stem>.dng when converting, else as-is.
+
+    Single source of truth for the mapping, so the copy loop, the low-space
+    estimate and the Helicon frame list can never disagree about it.
+    """
+    name = os.path.basename(source)
+    if converted:
+        name = f"{os.path.splitext(name)[0]}.dng"
+    return os.path.join(stack.dest_dir, name)
+
+
 def run_canon_import(args) -> int:
     """Execute --canon-import: scan, plan, preflight, copy, convert, report.
 
@@ -3222,7 +3264,12 @@ def run_canon_import(args) -> int:
     touched, the converter is preflighted before any file is written (a
     converter that cannot read this camera must fail in the first second,
     not at hour three of a 65 GB import), and a dry run stops right after
-    that preflight, having written nothing. The card is never modified --
+    that preflight. A dry run does still *run* that preflight, which
+    trial-converts one frame into a temporary directory it then discards:
+    that is deliberate, because proving this converter can read this camera
+    is most of what a dry run is for. Nothing is written to the destination
+    or the singles root, which is what "--dry writes no output files"
+    means. The card is never modified --
     every operation below is a copy, never a move or delete of anything
     under source_dir.
 
@@ -3283,7 +3330,7 @@ def run_canon_import(args) -> int:
     if plan.unresolved:
         print(f"{len(plan.unresolved)} composite(s) could not be grouped:")
         for group in plan.unresolved:
-            reason = group.notes[0] if group.notes else "no frames found"
+            reason = "; ".join(group.notes) or "no frames found"
             unresolved_src = os.path.join(
                 source_root, group.output_jpg.folder, group.output_jpg.name
             )
@@ -3331,6 +3378,24 @@ def run_canon_import(args) -> int:
                 "against; copying raw CR3 frames instead of converting."
             )
 
+    # Low-space check, exactly as every other mode does it: a list of
+    # (src, dest, op_type) tuples handed to confirm_if_low_space, which
+    # reports (but never prompts) under --dry. Each stack frame is sized
+    # from its CR3 source; when conversion is on the real DNG written in
+    # its place is *larger* than that, so this is a floor, not a ceiling.
+    ops_for_check: list[tuple[str, str, str]] = []
+    for stack in plan.stacks:
+        ops_for_check.append((stack.jpg_src, stack.jpg_dest, "copy"))
+        for source in stack.frame_sources:
+            ops_for_check.append(
+                (source, _canon_frame_dest(stack, source, converter is not None),
+                 "copy")
+            )
+    for source, dest in zip(plan.single_sources, plan.singles):
+        ops_for_check.append((source, dest, "copy"))
+    if ops_for_check:
+        confirm_if_low_space(ops_for_check, args.dry_run)
+
     if args.dry_run:
         print("Dry run: nothing was copied or converted.")
         return 0
@@ -3354,7 +3419,7 @@ def run_canon_import(args) -> int:
                 for source in stack.frame_sources:
                     frame_ok, _ = safe_file_operation(
                         "copy", source,
-                        os.path.join(stack.dest_dir, os.path.basename(source)),
+                        _canon_frame_dest(stack, source, False),
                         "copying", args.force, args.dry_run,
                     )
                     if not frame_ok:
@@ -3406,12 +3471,8 @@ def run_canon_import(args) -> int:
     # defect this branch has already had to fix twice), but one stack's
     # render failure must not stop the rest from being attempted.
     #
-    # No `and not args.dry_run` guard here: this code is already unreachable
-    # under --dry, because run_canon_import returns unconditionally above
-    # (see "if args.dry_run: ... return 0"), well before the copy loop and
-    # long before this point. A second dry-run check here would be dead --
-    # it could never see dry_run True -- and dead conditions are exactly the
-    # kind of thing that reads as a safety guard but tests nothing.
+    # No dry-run guard here: --dry already returned above, so one would be
+    # dead code.
     render_failures = 0
     if args.render_helicon:
         helicon = helicon_focus.find_helicon()
@@ -3424,17 +3485,38 @@ def run_canon_import(args) -> int:
         for stack in plan.stacks:
             if stack.dest_dir in failed_stack_dirs:
                 continue
-            if converter is not None:
-                frames = sorted(
-                    os.path.join(stack.dest_dir, name)
-                    for name in os.listdir(stack.dest_dir)
-                    if name.lower().endswith(".dng")
+            # The frame list comes from the PLAN, never from listing the
+            # folder. Two reasons, both silent-wrong-output bugs:
+            #
+            #   ORDER. Helicon methods A and B are order-dependent, and the
+            #   plan is in capture order. A stack spanning the camera's
+            #   IMG_9999 -> IMG_0001 folder rollover sorts
+            #   lexicographically into IMG_0001..0013 *before*
+            #   IMG_9988..9999 -- the two halves swapped, the focus
+            #   sequence scrambled, and a render that exits 0 looking fine.
+            #
+            #   STALENESS. A .dng left in the folder by an earlier run with
+            #   different grouping would otherwise be swept into the render.
+            #
+            # Both branches derive from stack.frame_sources so there is one
+            # rule, not two.
+            frames = [
+                _canon_frame_dest(stack, source, converter is not None)
+                for source in stack.frame_sources
+            ]
+            absent = [f for f in frames if not os.path.exists(f)]
+            if absent:
+                # A short stack renders silently wrong, which is worse than
+                # not rendering at all: report it and skip.
+                render_failures += 1
+                print(
+                    f"  Helicon skipped: {display_path(stack.dest_dir)}: "
+                    f"{len(absent)} of {len(frames)} frame(s) missing "
+                    f"({', '.join(os.path.basename(f) for f in absent[:3])}"
+                    f"{', and more' if len(absent) > 3 else ''}); rendering a "
+                    "partial stack would produce a silently wrong image"
                 )
-            else:
-                frames = [
-                    os.path.join(stack.dest_dir, os.path.basename(source))
-                    for source in stack.frame_sources
-                ]
+                continue
             output = os.path.join(
                 os.path.dirname(stack.dest_dir),
                 f"{os.path.basename(stack.dest_dir)} helicon.jpg",
@@ -3447,13 +3529,37 @@ def run_canon_import(args) -> int:
                 render_failures += 1
                 print(f"  Helicon failed: {display_path(output)}: {error}")
                 continue
-            if result.error:
+            if not result.ok:
                 render_failures += 1
                 print(f"  Helicon failed: {display_path(output)}: {result.error}")
             elif args.verbose and result.rendered:
                 print(f"  Rendered {display_path(output)}")
 
     return 1 if (stack_failures or failed_singles or render_failures) else 0
+
+
+# Conversion is CPU-bound and one process per folder; beyond a few dozen
+# the processes only contend. An unbounded value is a typo waiting to spawn
+# thousands of converters, so the flag is clamped rather than trusted.
+MAX_DNG_JOBS = 32
+
+
+def _dng_jobs_value(text: str) -> int:
+    """--dng-jobs, clamped at parse time to a range that can make sense.
+
+    Unbounded, a typo ("--dng-jobs 300" for "30") spawns one converter
+    process per stack folder with nothing to stop it. Rejecting it here
+    means the error arrives before a single byte is copied.
+    """
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{text}' is not an integer") from None
+    if not 1 <= value <= MAX_DNG_JOBS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 1 and {MAX_DNG_JOBS} (got {value})"
+        )
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3653,10 +3759,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dng-jobs",
-        type=int,
+        type=_dng_jobs_value,
         default=1,
         metavar="N",
-        help="Convert N stacks in parallel (default: 1).",
+        help=(
+            f"Convert N stacks in parallel, 1-{MAX_DNG_JOBS} (default: 1)."
+        ),
     )
     parser.add_argument(
         "--no-dng",
@@ -3674,10 +3782,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--helicon-method",
         type=int,
-        choices=(0, 1, 2),
-        default=2,
+        choices=(
+            helicon_focus.METHOD_A,
+            helicon_focus.METHOD_B,
+            helicon_focus.METHOD_C,
+        ),
+        default=helicon_focus.DEFAULT_METHOD,
         metavar="N",
-        help="Helicon rendering method: 0=A, 1=B, 2=C (default: 2).",
+        help=(
+            "Helicon rendering method: 0=A, 1=B, 2=C "
+            f"(default: {helicon_focus.DEFAULT_METHOD})."
+        ),
     )
 
     return parser
@@ -3769,10 +3884,8 @@ def main():
         parser.error("--no-dng can only be used with --canon-import.")
     if args.render_helicon and not args.canon_import:
         parser.error("--render-helicon can only be used with --canon-import.")
-    if args.helicon_method != 2 and not args.canon_import:
+    if args.helicon_method != helicon_focus.DEFAULT_METHOD and not args.canon_import:
         parser.error("--helicon-method can only be used with --canon-import.")
-    if args.dng_jobs < 1:
-        parser.error("--dng-jobs must be at least 1.")
 
     if args.debug_stacks:
         print(f"Running Stackcopy from: {os.path.abspath(__file__)}")
