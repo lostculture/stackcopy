@@ -532,7 +532,7 @@ Date filters work with all modes and use filesystem modification dates. In `--li
 These only apply with `--canon-import` and error out if used with any other mode.
 
 - `--singles-dir DIR` - Where loose CR3s that belong to no stack are copied (default: a `Single Images` folder beside `DEST_DIR`)
-- `--dng-jobs N` - Convert N stacks' worth of frames to DNG in parallel (default: 1)
+- `--dng-jobs N` - Convert N stacks' worth of frames to DNG in parallel (default: 1, maximum: 32)
 - `--no-dng` - Copy CR3 frames as-is instead of converting them to DNG; skips Adobe DNG Converter discovery and the preflight check entirely
 - `--render-helicon` - After importing, render each stack with Helicon Focus to `<stack> helicon.jpg` beside its folder
 - `--helicon-method {0,1,2}` - Helicon rendering method A/B/C (default: `2`, method C)
