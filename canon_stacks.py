@@ -131,7 +131,10 @@ def records_from_exiftool_json(payload) -> list[CanonFrame]:
 
 
 CONFIDENCE_ANCHOR = "anchor"
+CONFIDENCE_ANCHOR_CROSSFOLDER = "anchor-crossfolder"
 CONFIDENCE_CADENCE = "cadence"
+
+MAX_CROSS_FOLDER_GAP_SECONDS = 300
 
 MAX_CANON_STACK_FRAMES = 999  # Canon focus bracketing allows up to 999.
 
@@ -233,6 +236,58 @@ def _count_note(jpg: CanonFrame, frames: list[CanonFrame]) -> tuple[str, ...]:
     return ()
 
 
+def _previous_folder(index, folder: str) -> str | None:
+    """The numerically adjacent lower camera folder, if it is present.
+
+    Mirrors stackcopy.previous_adjacent_camera_dir: only the immediately
+    preceding folder number may extend a sequence across the boundary.
+    """
+    match = CAMERA_FOLDER_REGEX.match(folder)
+    if not match:
+        return None
+    number, tag = int(match.group(1)), match.group(2)
+    candidate = f"{number - 1:03d}{tag}"
+    return candidate if candidate in index else None
+
+
+def _extend_across_folder(
+    index, folder: str, run: list[CanonFrame], jpg: CanonFrame
+) -> list[CanonFrame] | None:
+    """Borrow frames from the previous folder's tail to complete a stack.
+
+    Only reached when the backward walk consumed its whole folder without
+    finding the anchor.  A borrowed frame must also be plausibly part of the
+    same capture: metadata proves the JPG is a composite, but proves nothing
+    about a file sitting in a different folder.
+    """
+    previous = _previous_folder(index, folder)
+    if previous is None:
+        return None
+    previous_numbers = [
+        number
+        for number, by_ext in index[previous].items()
+        if RAW_EXT in by_ext
+    ]
+    if not previous_numbers:
+        return None
+    tail_run = _preceding_run(index, previous, max(previous_numbers) + 1)
+    if not tail_run:
+        return None
+    combined = tail_run + run
+    frames = _anchor_cut(combined, jpg)
+    if frames is None:
+        return None
+    anchor_time = frames[0].timestamp
+    oldest_local = run[0].timestamp if run else None
+    if (
+        anchor_time is not None
+        and oldest_local is not None
+        and abs(oldest_local - anchor_time) > MAX_CROSS_FOLDER_GAP_SECONDS
+    ):
+        return None
+    return frames
+
+
 def group_canon_stacks(records: list[CanonFrame]) -> list[CanonStackGroup]:
     index = _index(records)
     groups: list[CanonStackGroup] = []
@@ -254,6 +309,16 @@ def group_canon_stacks(records: list[CanonFrame]) -> list[CanonStackGroup]:
         frames = _anchor_cut(run, jpg)
         confidence = CONFIDENCE_ANCHOR
         notes: tuple[str, ...] = ()
+        if frames is None and len(run) == len(
+            _preceding_run(index, jpg.folder, jpg.number)
+        ):
+            borrowed = _extend_across_folder(index, jpg.folder, run, jpg)
+            if borrowed is not None:
+                frames = borrowed
+                confidence = CONFIDENCE_ANCHOR_CROSSFOLDER
+                notes = (
+                    f"stack spans {borrowed[0].folder} into {jpg.folder}",
+                )
         if frames is None:
             frames = _cadence_cut(run)
             confidence = CONFIDENCE_CADENCE

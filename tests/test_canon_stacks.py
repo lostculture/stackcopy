@@ -171,3 +171,59 @@ def test_cadence_tolerates_flash_recycle_jitter():
 def test_cadence_group_is_flagged_in_notes():
     group = canon_stacks.group_canon_stacks(_run([0.07] * 5))[0]
     assert any("cadence" in note for note in group.notes)
+
+
+def test_stack_reaches_into_previous_camera_folder(records):
+    group = groups_by_output(canon_stacks.group_canon_stacks(records))[
+        "IMG_0014.JPG"
+    ]
+    assert group.confidence == canon_stacks.CONFIDENCE_ANCHOR_CROSSFOLDER
+    assert group.frames[0].folder == "107EOSR6"
+    assert group.frames[-1].name == "IMG_0013.CR3"
+    # The 108EOSR6 tail is contiguous and fully included.
+    tail = [f for f in group.frames if f.folder == "108EOSR6"]
+    assert [f.number for f in tail] == list(range(1, 14))
+
+
+def test_cross_folder_reach_respects_time_limit():
+    """A stale previous-folder frame is not borrowed just because its
+    timestamp text coincidentally equals the composite's anchor.
+
+    The brief's version of this test gave the old frame a *different*
+    timestamp_text ("old" vs. the jpg's "unmatched"), so `_anchor_cut` on
+    the combined run never found a match at all -- the assertion held
+    regardless of `MAX_CROSS_FOLDER_GAP_SECONDS`, even with that guard
+    deleted outright. Confirmed by temporarily removing the guard: the
+    brief's version still passed (vacuous). Giving the old frame and the
+    jpg the *same* timestamp_text makes `_extend_across_folder` actually
+    find and consider borrowing it, so the huge time gap is what has to
+    reject it.
+    """
+    old = canon_stacks.CanonFrame(
+        "107EOSR6", 9999, ".cr3", "IMG_9999.CR3",
+        timestamp_text="match", timestamp=0.0, depth_composite=True,
+    )
+    frames = [old] + [
+        canon_stacks.CanonFrame(
+            "108EOSR6", n, ".cr3", f"IMG_{n:04d}.CR3",
+            timestamp_text=f"t{n}", timestamp=100000.0 + n * 0.07,
+            depth_composite=True,
+        )
+        for n in range(1, 6)
+    ]
+    jpg = canon_stacks.CanonFrame(
+        "108EOSR6", 6, ".jpg", "IMG_0006.JPG",
+        timestamp_text="match", timestamp=100010.0, depth_composite=True,
+    )
+    group = canon_stacks.group_canon_stacks(frames + [jpg])[0]
+    assert all(f.folder == "108EOSR6" for f in group.frames)
+
+
+def test_numbering_gap_bounds_a_run(records):
+    """IMG_0902 was deleted in camera; IMG_0929's stack must not span it."""
+    group = groups_by_output(canon_stacks.group_canon_stacks(records))[
+        "IMG_0929.JPG"
+    ]
+    numbers = [f.number for f in group.frames]
+    assert 902 not in numbers
+    assert numbers == list(range(min(numbers), 929))
