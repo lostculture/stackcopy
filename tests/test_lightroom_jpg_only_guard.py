@@ -139,7 +139,9 @@ class LightroomJpgOnlyGuardTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(), "Stackcopy 1.7.0")
+        self.assertEqual(
+            result.stdout.strip(), f"Stackcopy {stackcopy_module.STACKCOPY_VERSION}"
+        )
 
     def test_lightroomimport_jpg_only_repro_imports_all_as_remaining(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -136,10 +136,12 @@ and where to get a newer converter - instead of failing partway through a
 65 GB import several hours in.
 
 This detection and conversion path has so far been exercised against a
-single camera body, the Canon EOS R6 Mark II, and a single test card. It
-should generalize to other recent EOS R and PowerShot bodies that write the
-same `FocusBracketingDepthComposite`/`FocusBracketingImageCount` MakerNotes,
-but that has not been verified.
+single camera body, the Canon EOS R6 Mark II, and a single test card.
+Detection itself relies only on the `FocusBracketingDepthComposite` and
+`FocusBracketingImageCount` MakerNotes and Canon's standard `IMG_####.CR3`
+file numbering, so any body that writes those the same way is reading the
+same signals this code already handles - but which specific other bodies do
+that has not been checked.
 
 Supported video extensions for `--lightroomimport`: `.mov`, `.mp4`, `.m4v`, `.avi`, `.mts`, `.m2ts`, `.mpg`, `.mpeg`, `.wmv`.
 
