@@ -1,5 +1,7 @@
+import os
 import stat
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -104,3 +106,63 @@ def test_existing_output_is_not_rerendered(tmp_path):
     )
     assert result.skipped is True
     assert result.error is None
+
+
+def test_find_helicon_falls_back_to_path(tmp_path, monkeypatch):
+    """Symmetry with find_dng_converter: a PATH install is discoverable.
+
+    Without this fallback a Helicon that is installed but not at one of the
+    two hardcoded Program Files paths reports as "not found", which under
+    --render-helicon fails the whole run.
+    """
+    monkeypatch.delenv(helicon_focus.HELICON_ENV, raising=False)
+    monkeypatch.setattr(helicon_focus, "_candidate_paths", lambda: [])
+    monkeypatch.setattr(
+        helicon_focus.shutil, "which",
+        lambda name: "/opt/helicon/HeliconFocus" if name == "HeliconFocus" else None,
+    )
+    assert helicon_focus.find_helicon() == "/opt/helicon/HeliconFocus"
+
+
+def test_frame_list_defaults_to_the_system_temp_directory(tmp_path):
+    """Not a destination folder: mkstemp(dir=None) is the system temp dir."""
+    path = helicon_focus.write_file_list(["/a.dng", "/b.dng"])
+    try:
+        assert Path(path).parent == Path(tempfile.gettempdir())
+    finally:
+        os.unlink(path)
+
+
+def test_render_writes_its_frame_list_outside_the_destination(
+    tmp_path, monkeypatch
+):
+    """A killed run must not leave stackcopy-helicon-*.txt among the DNGs.
+
+    render_stack deletes the list in a ``finally``, so a completed run
+    never leaves one behind either way -- which is exactly why asserting
+    "the folder is clean afterwards" would pass whether the file was ever
+    written there or not. What matters is WHERE it lived while Helicon was
+    running, so that is what this captures.
+    """
+    dest = tmp_path / "stack"
+    dest.mkdir()
+    out = dest / "out.jpg"
+    stub = make_stub(tmp_path, f'echo img > "{out}"')
+
+    real = helicon_focus.write_file_list
+    seen = {}
+
+    def spy(frames, directory=None):
+        path = real(frames, directory)
+        seen["path"] = path
+        seen["existed_in_dest"] = Path(path).parent == dest
+        return path
+
+    monkeypatch.setattr(helicon_focus, "write_file_list", spy)
+    result = helicon_focus.render_stack(stub, ["/a.dng", "/b.dng"], str(out))
+
+    assert result.ok
+    assert seen["existed_in_dest"] is False, (
+        "the frame list was written into the destination folder"
+    )
+    assert not Path(seen["path"]).exists(), "and it must still be cleaned up"

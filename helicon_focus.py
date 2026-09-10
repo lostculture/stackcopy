@@ -9,6 +9,7 @@ camera's composite JPG, which must never enter the stack).
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,17 +49,28 @@ def _candidate_paths() -> list[str]:
 
 
 def find_helicon() -> str | None:
+    """Env override, then platform defaults, then PATH.
+
+    The PATH fallback mirrors find_dng_converter(): a Helicon installed
+    somewhere other than the two default locations is still discoverable.
+    """
     override = (os.environ.get(HELICON_ENV) or "").strip()
     if override:
         return override if os.path.isfile(override) else None
     for candidate in _candidate_paths():
         if os.path.isfile(candidate):
             return candidate
-    return None
+    return shutil.which("HeliconFocus")
 
 
-def write_file_list(frames: list[str], directory: str) -> str:
-    """One absolute path per line, as -i expects."""
+def write_file_list(frames: list[str], directory: str | None = None) -> str:
+    """One absolute path per line, as -i expects.
+
+    ``directory`` defaults to the system temp directory rather than the
+    destination: a killed run must not strew stackcopy-helicon-*.txt
+    scratch files through the user's imported stack folders, where they
+    would sit next to the DNGs forever.
+    """
     handle, path = tempfile.mkstemp(
         prefix="stackcopy-helicon-", suffix=".txt", dir=directory
     )
@@ -121,7 +133,7 @@ def render_stack(
     try:
         directory = os.path.dirname(output_path) or "."
         os.makedirs(directory, exist_ok=True)
-        listing = write_file_list(frames, directory)
+        listing = write_file_list(frames)
         completed = subprocess.run(
             render_command(
                 helicon, listing, output_path,
