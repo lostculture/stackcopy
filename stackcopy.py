@@ -2952,9 +2952,13 @@ def read_canon_stack_metadata(paths: list[str]) -> list["canon_stacks.CanonFrame
     return canon_stacks.records_from_exiftool_json(collected)
 
 
-def main():
-    """Main program entry point."""
-    # Set up argument parser
+def build_parser() -> argparse.ArgumentParser:
+    """Build the Stackcopy command-line argument parser.
+
+    Extracted from main() so argument parsing (and, via parse_arguments(),
+    an explicit argv) can be exercised without running the rest of the
+    program.
+    """
     parser = argparse.ArgumentParser(
         description=(
             f"Stackcopy {STACKCOPY_VERSION} - process JPG files without "
@@ -3121,7 +3125,20 @@ def main():
         ),
     )
 
-    # Parse arguments
+    return parser
+
+
+def parse_arguments(argv=None) -> argparse.Namespace:
+    """Parse Stackcopy command-line arguments.
+
+    A thin wrapper over build_parser() so tests (and other callers) can
+    parse an explicit argv list without running main().
+    """
+    return build_parser().parse_args(argv)
+
+
+def main():
+    """Main program entry point."""
     # --- 0. Execution Tracking & Summary Statistics ---
     processed_count = 0
     skipped_count = 0
@@ -3161,7 +3178,8 @@ def main():
     # counted as moved.
     lightroom_source_remains_count = 0
 
-    args = parser.parse_args()
+    parser = build_parser()
+    args = parse_arguments()
 
     # Say which Stackcopy this is without being asked.  On stderr, because
     # stdout has to stay usable for pipes and is exactly one JSON object under
