@@ -200,30 +200,44 @@ def _cadence_cut(
     run: list[CanonFrame],
     tail: int = CADENCE_TAIL_GAPS,
     factor: float = CADENCE_FACTOR,
-) -> list[CanonFrame]:
+) -> tuple[list[CanonFrame], int]:
     """Walk back from the newest frame while the interval stays consistent.
 
     The reference interval comes from the *tail* of the run - the frames
     nearest the composite, which are certainly part of the stack.  Using the
     whole run's median would be contaminated by the very ordinary shots this
     cut exists to exclude.
+
+    Returns the frames kept and how many frames *inside* the kept range were
+    dropped only because they carry no timestamp.  Cadence reasoning is
+    impossible without one, so such frames cannot be placed -- but under a
+    partial ExifTool failure that silently shortens a stack, which is why
+    the count is reported back rather than swallowed.
     """
     timed = [f for f in run if f.timestamp is not None]
     if len(timed) < 2:
-        return list(run)
+        return list(run), 0
+
+    def _kept(frames: list[CanonFrame]) -> tuple[list[CanonFrame], int]:
+        if not frames:
+            return frames, 0
+        first = run.index(frames[0])
+        dropped = sum(1 for f in run[first:] if f.timestamp is None)
+        return frames, dropped
+
     gaps = [
         timed[i + 1].timestamp - timed[i].timestamp for i in range(len(timed) - 1)
     ]
     reference = statistics.median(gaps[-tail:] if len(gaps) > tail else gaps)
     if reference <= 0:
-        return list(timed)
+        return _kept(timed)
     tolerance = reference * factor
     cut = 0
     for position in range(len(gaps) - 1, -1, -1):
         if gaps[position] > tolerance:
             cut = position + 1
             break
-    return timed[cut:]
+    return _kept(timed[cut:])
 
 
 def _count_note(jpg: CanonFrame, frames: list[CanonFrame]) -> tuple[str, ...]:
@@ -327,12 +341,17 @@ def group_canon_stacks(records: list[CanonFrame]) -> list[CanonStackGroup]:
                     f"stack spans {borrowed[0].folder} into {jpg.folder}",
                 )
         if frames is None and run:
-            frames = _cadence_cut(run)
+            frames, undated = _cadence_cut(run)
             confidence = CONFIDENCE_CADENCE
             notes = (
                 "no frame matched the composite timestamp; "
                 "grouped by cadence",
             )
+            if undated:
+                notes += (
+                    f"{undated} frame(s) in this range were left out: "
+                    "no timestamp could be read for them",
+                )
         if not frames:
             continue
         groups.append(

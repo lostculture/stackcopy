@@ -175,6 +175,31 @@ def test_cadence_group_is_flagged_in_notes():
     assert any("cadence" in note for note in group.notes)
 
 
+def test_cadence_notes_frames_dropped_for_a_missing_timestamp():
+    """Fix round 2, item 7: silently shorter stacks must announce themselves.
+
+    _cadence_cut can only place a frame it can time, so a frame whose
+    SubSecDateTimeOriginal could not be read (a partial ExifTool failure on
+    one file of a batch) is dropped from the middle of the stack. Dropping
+    it is the right call -- there is nothing to reason with -- but doing it
+    without a word leaves the user with a stack quietly missing a slice of
+    the focus sweep and no hint why.
+    """
+    records = _run([0.07] * 6)
+    frames = [r for r in records if r.ext == ".cr3"]
+    blind = frames[3]
+    records[records.index(blind)] = canon_stacks.CanonFrame(
+        blind.folder, blind.number, blind.ext, blind.name,
+        timestamp_text=None, timestamp=None,
+    )
+
+    group = canon_stacks.group_canon_stacks(records)[0]
+
+    assert group.confidence == canon_stacks.CONFIDENCE_CADENCE
+    assert blind.name not in [f.name for f in group.frames]
+    assert any("no timestamp" in note for note in group.notes), group.notes
+
+
 def test_stack_reaches_into_previous_camera_folder(records):
     group = groups_by_output(canon_stacks.group_canon_stacks(records))[
         "IMG_0014.JPG"
@@ -367,6 +392,51 @@ def test_canon_metadata_read_parses_batch(monkeypatch, capsys):
     assert frames[0].image_count == 25
     assert frames[0].timestamp_text == "2026:07:31 10:44:02.03-04:00"
     # A fully-reported batch is not degraded, so no warning is printed.
+    assert capsys.readouterr().out == ""
+
+
+def test_canon_metadata_is_parsed_regardless_of_exiftool_exit_status(
+    monkeypatch, capsys
+):
+    """ExifTool's exit status is not a verdict on the batch's JSON.
+
+    ExifTool exits non-zero when *any* file in a batch is unreadable, while
+    still printing complete, valid records for every file it could read.
+    Treating a non-zero exit as "discard this batch" would throw away
+    hundreds of good records because one file on the card had a bad sector,
+    and would silently degrade every one of them to filename-only -- which
+    drops the composite flags that grouping depends on. Parse the stdout;
+    the per-file reconciliation below already catches anything genuinely
+    absent from it.
+    """
+    payload = (
+        '[{"SourceFile":"/card/108EOSR6/IMG_0002.JPG",'
+        '"SubSecDateTimeOriginal":"2026:07:31 10:44:02.03-04:00",'
+        '"FocusBracketingDepthComposite":1,'
+        '"FocusBracketingImageCount":25}]'
+    )
+    monkeypatch.setattr(
+        stackcopy, "exiftool_info",
+        lambda: stackcopy.ExifToolInfo(
+            executable="/usr/bin/exiftool", version="13.59",
+            version_tuple=(13, 59), source=stackcopy.ExifToolSource.PATH,
+        ),
+    )
+    monkeypatch.setattr(
+        subprocess, "run",
+        # Exit 1 -- as ExifTool really does when a sibling file in the batch
+        # is unreadable -- with entirely valid stdout for the file it read.
+        lambda *a, **k: subprocess.CompletedProcess(a, 1, payload, "Error: ..."),
+    )
+    frames = stackcopy.read_canon_stack_metadata(
+        ["/card/108EOSR6/IMG_0002.JPG"]
+    )
+    assert len(frames) == 1
+    assert frames[0].depth_composite is True, (
+        "the record was discarded because of the exit status"
+    )
+    assert frames[0].image_count == 25
+    assert frames[0].timestamp_text == "2026:07:31 10:44:02.03-04:00"
     assert capsys.readouterr().out == ""
 
 
