@@ -140,3 +140,104 @@ def test_convert_group_resumes_completed_work(tmp_path):
     assert result.skipped == 2
     assert result.converted == 0
     assert result.error is None
+
+
+def _success_stub(tmp_path, name="success_stub"):
+    """A converter stub that writes a .dng for every input file it's given."""
+    if sys.platform == "win32":
+        body = r'for %%f in (%*) do @if not "%%~xf"==".dng" echo d > "%~4\%%~nf.dng"'
+    else:
+        body = (
+            'd="$4"; shift 4; mkdir -p "$d"; '
+            'for f; do echo d > "$d/$(basename "${f%.*}").dng"; done'
+        )
+    return make_stub(tmp_path, body, name)
+
+
+def _one_file_job(tmp_path, tag):
+    src = tmp_path / f"src_{tag}"
+    src.mkdir()
+    f = src / "IMG_0001.CR3"
+    f.write_bytes(b"raw")
+    dest = tmp_path / f"out_{tag}"
+    return str(dest), [str(f)]
+
+
+def test_convert_groups_sequential_returns_one_result_per_group_in_order(tmp_path):
+    stub = _success_stub(tmp_path)
+    jobs = [_one_file_job(tmp_path, "a"), _one_file_job(tmp_path, "b")]
+
+    results = dng_converter.convert_groups(stub, jobs, workers=1)
+
+    assert [r.dest_dir for r in results] == [dest for dest, _ in jobs]
+    assert all(r.ok for r in results)
+    assert all(r.converted == 1 for r in results)
+
+
+def test_convert_groups_threaded_returns_one_result_per_group(tmp_path):
+    stub = _success_stub(tmp_path)
+    jobs = [_one_file_job(tmp_path, tag) for tag in ("x", "y", "z")]
+
+    results = dng_converter.convert_groups(stub, jobs, workers=3)
+
+    by_dest = {r.dest_dir: r for r in results}
+    assert set(by_dest) == {dest for dest, _ in jobs}
+    assert all(r.ok for r in by_dest.values())
+    assert all(r.converted == 1 for r in by_dest.values())
+
+
+def test_convert_groups_calls_on_progress_once_per_group(tmp_path):
+    stub = _success_stub(tmp_path)
+    jobs = [_one_file_job(tmp_path, tag) for tag in ("p", "q", "r")]
+    seen = []
+
+    dng_converter.convert_groups(stub, jobs, workers=1, on_progress=seen.append)
+
+    assert len(seen) == 3
+    assert {r.dest_dir for r in seen} == {dest for dest, _ in jobs}
+
+
+def test_convert_groups_isolates_a_failing_group(tmp_path):
+    """A group whose dest_dir can't be created must not sink the other groups.
+
+    Regression for the bug where os.makedirs() sat outside convert_group's
+    try/except: an exception there escaped convert_group entirely, which in
+    turn aborted convert_groups' loop -- discarding results already
+    collected for groups that succeeded, and skipping every group after the
+    failing one. dest_b is made to collide with an existing plain file, so
+    os.makedirs(dest_b, exist_ok=True) raises even though exist_ok=True,
+    because the colliding path is a file, not a directory.
+    """
+    stub = _success_stub(tmp_path)
+    dest_a, files_a = _one_file_job(tmp_path, "a")
+    dest_b, files_b = _one_file_job(tmp_path, "b")
+    dest_c, files_c = _one_file_job(tmp_path, "c")
+    Path(dest_b).write_bytes(b"a plain file sitting where a directory is expected")
+
+    jobs = [(dest_a, files_a), (dest_b, files_b), (dest_c, files_c)]
+    results = dng_converter.convert_groups(stub, jobs, workers=1)
+
+    assert len(results) == 3
+    by_dest = {r.dest_dir: r for r in results}
+    assert by_dest[dest_a].ok
+    assert by_dest[dest_c].ok
+    assert not by_dest[dest_b].ok
+    assert by_dest[dest_b].error is not None
+
+
+def test_convert_group_reports_timeout_as_failure(tmp_path):
+    """A converter that hangs must be reported as a failure, not a success."""
+    body = f'"{sys.executable}" -c "import time; time.sleep(2)"'
+    stub = make_stub(tmp_path, body, name="slow_stub")
+    src = tmp_path / "src"
+    src.mkdir()
+    f = src / "IMG_0001.CR3"
+    f.write_bytes(b"raw")
+    dest = tmp_path / "out"
+
+    result = dng_converter.convert_group(stub, [str(f)], str(dest), timeout=0.5)
+
+    assert result.ok is False
+    assert result.failed == 1
+    assert result.error is not None
+    assert "timed out" in result.error

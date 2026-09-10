@@ -181,6 +181,28 @@ def _expected_dng(dest_dir: str, source: str) -> str:
     return os.path.join(dest_dir, f"{stem}.dng")
 
 
+_ERROR_TAIL_LIMIT = 400
+
+
+def _tail(text: str | None, limit: int = _ERROR_TAIL_LIMIT) -> str:
+    """Last `limit` chars of captured converter output, for diagnostics only.
+
+    This is NEVER consulted to decide success or failure (see module
+    docstring): the real Adobe binary prints Sensei/WinML error text to
+    stderr on fully successful conversions, so any output-parsing in the
+    decision path would misreport total success as total failure. It exists
+    purely so a failure message tells a user more than a bare exit code.
+    """
+    if not text:
+        return ""
+    text = text.strip()
+    if not text:
+        return ""
+    if len(text) > limit:
+        text = "...(truncated)... " + text[-limit:]
+    return f" Converter output: {text}"
+
+
 def convert_group(
     converter: str,
     files: list[str],
@@ -190,7 +212,27 @@ def convert_group(
     """Convert one stack's frames into dest_dir.
 
     Already-converted frames are skipped, so an interrupted import resumes.
+    Any unexpected exception (e.g. os.makedirs failing on a colliding path,
+    a full disk, a permissions error) is caught and turned into a failed
+    result for this group rather than propagating, so one bad group cannot
+    abort the whole batch or discard results already collected for others.
     """
+    try:
+        return _convert_group(converter, files, dest_dir, timeout)
+    except Exception as error:
+        return ConversionResult(
+            dest_dir,
+            failed=len(files),
+            error=f"unexpected error converting group: {error}",
+        )
+
+
+def _convert_group(
+    converter: str,
+    files: list[str],
+    dest_dir: str,
+    timeout: float | None,
+) -> ConversionResult:
     os.makedirs(dest_dir, exist_ok=True)
     pending = [f for f in files if not os.path.exists(_expected_dng(dest_dir, f))]
     skipped = len(files) - len(pending)
@@ -209,10 +251,11 @@ def convert_group(
             errors="replace",
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as error:
+        tail = _tail(error.stdout) or _tail(error.stderr)
         return ConversionResult(
             dest_dir, skipped=skipped, failed=len(pending),
-            error=f"conversion timed out after {timeout:.0f}s",
+            error=f"conversion timed out after {timeout:.0f}s.{tail}",
         )
     except (OSError, subprocess.SubprocessError) as error:
         return ConversionResult(
@@ -225,6 +268,7 @@ def convert_group(
         detail = ", ".join(os.path.basename(f) for f in missing[:3])
         if len(missing) > 3:
             detail += f", and {len(missing) - 3} more"
+        tail = _tail(completed.stderr) or _tail(completed.stdout)
         return ConversionResult(
             dest_dir,
             converted=len(pending) - len(missing),
@@ -232,7 +276,7 @@ def convert_group(
             failed=len(missing),
             error=(
                 f"converter exited {completed.returncode} without producing "
-                f"DNG for {detail}"
+                f"DNG for {detail}.{tail}"
             ),
         )
     return ConversionResult(dest_dir, converted=len(pending), skipped=skipped)
@@ -260,11 +304,24 @@ def convert_groups(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(convert_group, converter, files, dest_dir): dest_dir
+            pool.submit(convert_group, converter, files, dest_dir): (dest_dir, files)
             for dest_dir, files in jobs_by_dest
         }
         for future in concurrent.futures.as_completed(futures):
-            result = future.result()
+            dest_dir, files = futures[future]
+            try:
+                result = future.result()
+            except Exception as error:
+                # convert_group already catches its own exceptions, but a
+                # worker can still fail at the executor level (e.g. a
+                # cancelled future) for reasons the group body can't guard
+                # against. One group's failure must never lose results
+                # already collected for others.
+                result = ConversionResult(
+                    dest_dir,
+                    failed=len(files),
+                    error=f"conversion worker failed: {error}",
+                )
             results.append(result)
             if on_progress:
                 on_progress(result)
