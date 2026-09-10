@@ -51,17 +51,29 @@ design:
 ### The timestamp anchor
 
 A composite JPG's `SubSecDateTimeOriginal` is byte-identical to that of the
-**first frame** of its stack. Measured over all 101 groups: **95 exact matches,
-6 misses.**
+**first frame** of its stack. Measured across all 101 composites in `108EOSR6`:
 
-On all six misses the anchor was correct and naive run-splitting was wrong:
+| Outcome | Count |
+|---|---|
+| Anchor frame found within the preceding CR3 run | **100** |
+| — of which the anchor is the run's first frame (naive splitting also correct) | 95 |
+| — of which the anchor is mid-run (**naive splitting wrong**) | 5 |
+| No anchor in this folder (stack crosses a folder boundary) | 1 |
 
-| Composite | Naive run | Anchor frame | True count | Excluded |
+The distinction matters. On the five mid-run cases the anchor is correct and
+walking back over the whole contiguous run silently absorbs unrelated frames:
+
+| Composite | Naive run | Anchor frame | True count | Frames naive would have added |
 |---|---|---|---|---|
-| `IMG_0096.JPG` | 29 frames from `IMG_0067` | `IMG_0071` | 25 | `IMG_0067–0070`, shot ~1 hour earlier |
-| `IMG_1957.JPG` | 28 frames from `IMG_1929` | `IMG_1932` | 25 | `IMG_1929–1931`, shot ~50 s earlier |
-| `IMG_0175`, `IMG_0929`, `IMG_2412` | 26 frames | not individually traced | 25 (inferred) | one ordinary shot each (inferred by analogy; to be confirmed by the read-only detection run) |
-| `IMG_0014.JPG` | 13 frames | not in folder | 25 | stack crosses a folder boundary |
+| `IMG_0096.JPG` | 29 | `IMG_0071` | 25 | 4 (`IMG_0067-0070`, shot ~1 hour earlier) |
+| `IMG_1957.JPG` | 28 | `IMG_1932` | 25 | 3 (`IMG_1929-1931`, shot ~50 s earlier) |
+| `IMG_0175.JPG` | 26 | mid-run | 25 | 1 |
+| `IMG_0929.JPG` | 26 | mid-run | 25 | 1 |
+| `IMG_2412.JPG` | 26 | mid-run | 25 | 1 |
+
+Every true stack resolves to 25 frames, matching the camera's bracketing
+setting. The single remaining composite, `IMG_0014.JPG`, is the cross-folder
+case below.
 
 Naive run-splitting would have silently poisoned five stacks with unrelated
 RAW frames. The anchor is therefore not merely an optimisation over
@@ -74,6 +86,12 @@ sequence-and-timestamp grouping; it is a correctness fix.
 previous camera folder: `107EOSR6\IMG_9995–9999.CR3` run `10:44:00.88` to
 `10:44:01.80` at the same 0.23 s interval as `108EOSR6\IMG_0001–0013.CR3`.
 The stack spans the 9999 → 0001 folder rollover.
+
+At that 0.23 s cadence the anchor timestamp lands on `IMG_9988.CR3`, making the
+stack `IMG_9988`-`IMG_9999` (12 frames) plus `IMG_0001`-`IMG_0013` (13) = **25**,
+in line with every other full stack on the card. `107EOSR6\IMG_9987.JPG` is the
+*previous* stack's own composite and is correctly excluded. Confirmed against
+the captured fixture.
 
 The card holds nine camera folders (`100EOSR6` … `108EOSR6`).
 
