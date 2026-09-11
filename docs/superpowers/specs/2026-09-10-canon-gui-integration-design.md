@@ -116,37 +116,62 @@ than silently ignoring a choice the user made.
 `STACKCOPY_STACK_INPUT_DIR`. The two destination pickers stay, relabelled
 "Stacked images" and "Single images".
 
-### Component 3 — The Advanced section
+### Component 3 — Where the controls live
 
-All Canon controls live in Advanced, alongside the existing three:
+Canon-specific controls appear on the main panel, but only once a Canon card
+is detected. Helicon's rendering options stay in Advanced. The split follows
+what each control is for: whether this is a Canon card changes what the import
+*does* and is worth stating plainly, while method, radius and smoothing are
+tuning a photographer sets to taste and rarely revisits.
+
+Main panel, shown only when Canon mode is active:
+
+```
+[x] Canon card (CR3 to DNG) - found 1719 CR3 files
+[x] Convert CR3 to DNG              Parallel conversions [ 4 ]
+```
+
+Advanced, alongside the existing three checkboxes:
 
 ```
 Advanced
    [x] Verbose log      [x] Detect stacks      [ ] Show stack debug
    ------------------------------------------------------------------
-   [x] Convert CR3 to DNG               Parallel conversions [ 4 ]
    [ ] Render with Helicon Focus
           Method  ( A ) ( B ) (*C)      Radius [ 8 ]   Smoothing [ 4 ]
 ```
 
+- **Canon card (CR3 to DNG)** selects the mode. Auto-ticked by detection
+  (Component 2) with the reason beside it, and overridable in both directions.
 - **Convert CR3 to DNG** maps to the absence of `--no-dng`; default on.
 - **Parallel conversions** maps to `--dng-jobs`, clamped 1-32 as the CLI does.
 - **Render with Helicon Focus** maps to `--render-helicon`; default off,
-  because it materially lengthens a run.
-- **Method** maps to `--helicon-method` (0=A, 1=B, 2=C), defaulting to C as the
-  CLI does. A segmented control rather than a dropdown: it is a real choice
-  between three peers, not a list.
+  because it materially lengthens a run. On the measured K: card the import
+  took three hours and forty-seven minutes with rendering on.
+- **Method** maps to `--helicon-method` (0=A, 1=B, 2=C), defaulting to C. A
+  segmented control rather than a dropdown: three peers, not a list.
 - **Radius** and **Smoothing** are integer fields defaulting to the CLI's 8 and
-  4. They are passed only when changed from those defaults, so the GUI does not
-  pin values the CLI may later retune.
+  4, passed only when changed from those defaults so the GUI does not pin
+  values the CLI may later retune.
 
-Canon-only controls are disabled, not hidden, when Canon mode is off — a hidden
-control is one the user cannot discover. The Helicon sub-controls are disabled
-unless **Render with Helicon Focus** is ticked.
+The Canon block is hidden rather than disabled when the card is not Canon:
+unlike a tuning control, it has no meaning at all for an Olympus card, and an
+always-present disabled checkbox inviting the user to declare a Canon card that
+is not there would be noise. The Helicon sub-controls are disabled, not hidden,
+unless **Render with Helicon Focus** is ticked - they are meaningful, just not
+yet active.
 
 Every value persists to `gui-state.json` through the existing `state_text()` /
 `state_flag()` helpers, under keys `canon_mode`, `canon_dng`, `canon_dng_jobs`,
 `canon_render`, `canon_method`, `canon_radius`, `canon_smoothing`.
+
+**Dependency.** The Advanced section had a separate defect: its caret was
+hard-coded to the collapsed glyph at construction and only corrected on toggle,
+so a window restored with the section open showed its content while still
+offering to open it, and the first click hid what the user meant to reveal.
+That is upstream's bug, not this feature's, and is fixed on its own branch
+(`fix-advanced-toggle-label`). This work assumes that fix is in place; without
+it, controls added to Advanced inherit the confusion.
 
 ### Component 4 — Skip Helicon for single-frame stacks
 
