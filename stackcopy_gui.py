@@ -242,6 +242,17 @@ def exiftool_status_display(
     return None
 
 
+def advanced_button_label(is_open: bool) -> str:
+    """The disclosure label for the Advanced section.
+
+    The caret has to be derived from the state rather than written out, or a
+    window restored with the section already open contradicts itself: the
+    content is on screen while the control still offers to open it, and the
+    first click closes what the user was trying to reveal.
+    """
+    return "Advanced ▴" if is_open else "Advanced ▾"
+
+
 def import_button_label(
     plan: dict[str, object] | None,
     *,
@@ -1022,7 +1033,9 @@ class StackcopyGUI(ctk.CTk):
         )
         self.preview_btn.grid(row=0, column=1, padx=(10, 0))
         self.advanced_btn = self._text_button(
-            self.actions, "Advanced ▾", self._toggle_advanced
+            self.actions,
+            advanced_button_label(self._advanced_open),
+            self._toggle_advanced,
         )
         self.advanced_btn.grid(row=0, column=3, sticky="e")
         self.advanced_frame = ctk.CTkFrame(self.actions, fg_color="transparent")
@@ -1608,10 +1621,11 @@ class StackcopyGUI(ctk.CTk):
         self._advanced_open = not self._advanced_open
         if self._advanced_open:
             self.advanced_frame.grid()
-            self.advanced_btn.configure(text="Advanced ▴")
         else:
             self.advanced_frame.grid_remove()
-            self.advanced_btn.configure(text="Advanced ▾")
+        self.advanced_btn.configure(
+            text=advanced_button_label(self._advanced_open)
+        )
         self._save_current_defaults()
 
     def _toggle_log(self) -> None:

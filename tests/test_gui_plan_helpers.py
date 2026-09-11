@@ -443,3 +443,24 @@ class TerminalSummaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdvancedButtonLabelTests(unittest.TestCase):
+    """The caret must follow the section's state, not a hard-coded default.
+
+    A window restored with Advanced already open used to show the content
+    alongside a control still offering to open it, so the first click hid what
+    the user was trying to reveal.
+    """
+
+    def test_an_open_section_offers_to_close(self):
+        self.assertEqual(gui.advanced_button_label(True), "Advanced ▴")
+
+    def test_a_closed_section_offers_to_open(self):
+        self.assertEqual(gui.advanced_button_label(False), "Advanced ▾")
+
+    def test_the_two_states_never_share_a_label(self):
+        self.assertNotEqual(
+            gui.advanced_button_label(True), gui.advanced_button_label(False)
+        )
+
