@@ -1107,6 +1107,138 @@ def test_render_helicon_skips_a_stack_whose_copy_already_failed(
     assert stack_dirs[1].name in calls[0]
 
 
+def _progress_events(fn, *args, **kwargs):
+    """Run ``fn`` with STACKCOPY_PROGRESS on, returning parsed (fields,
+    filename) pairs for every emitted sentinel line, in order."""
+    captured = io.StringIO()
+    with mock.patch.object(stackcopy, "_PROGRESS_ENABLED", True), \
+         mock.patch.object(stackcopy.sys, "stderr", captured):
+        exit_code = fn(*args, **kwargs)
+    lines = [
+        ln for ln in captured.getvalue().splitlines()
+        if ln.startswith(gui.PROGRESS_SENTINEL)
+    ]
+    return exit_code, [gui.parse_progress(ln) for ln in lines]
+
+
+def test_no_dng_frame_copies_are_reported_and_reach_full_progress(
+    tmp_path, monkeypatch
+):
+    """Task 5 fix round 1, item 1: under --no-dng, stack frames are copied
+    raw in run_canon_import's ``else`` branch (converter is None), which
+    used to neither emit progress nor increment ``done`` for them. A real
+    --no-dng run with frames therefore left the GUI's bar permanently short
+    and its ETA wrong. This pins both the per-frame emission and the
+    resulting done == total at the end of a --no-dng run with real frames.
+    """
+    plan, stack_dir = _one_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"), "--no-dng"]
+    )
+    exit_code, events = _progress_events(stackcopy.run_canon_import, args)
+
+    assert exit_code == 0
+    frame_names = {
+        filename for fields, filename in events if fields.get("role") == "frames"
+    }
+    assert frame_names == {"IMG_0001.CR3", "IMG_0002.CR3"}, (
+        "each raw frame copy under --no-dng must emit its own progress event, "
+        f"got {frame_names}"
+    )
+    last_fields, _ = events[-1]
+    assert last_fields["done"] == last_fields["total"], (
+        "the run must finish with done == total: "
+        f"got done={last_fields['done']} total={last_fields['total']}"
+    )
+
+
+def test_convert_phase_is_reported_and_reaches_full_progress(tmp_path, monkeypatch):
+    """Task 5 fix round 1, item 3: the convert phase (the ``else`` branch's
+    opposite -- taken whenever --no-dng is absent) had zero progress test
+    coverage, which is exactly where fix round 1's items 1 and 2 lived
+    undetected. ``_fake_convert_groups_writing_dngs`` (used by the render
+    tests above) never calls ``on_progress``, so it cannot exercise this
+    either -- this test's fake convert_groups deliberately does.
+    """
+    plan, stack_dir = _one_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
+    )
+    monkeypatch.setattr(stackcopy.dng_converter, "preflight", lambda *a, **k: None)
+
+    def fake_convert_groups(converter, jobs_by_dest, workers=1, on_progress=None):
+        results = []
+        for dest_dir, files in jobs_by_dest:
+            result = stackcopy.dng_converter.ConversionResult(
+                dest_dir, converted=len(files)
+            )
+            results.append(result)
+            if on_progress:
+                on_progress(result)
+        return results
+
+    monkeypatch.setattr(
+        stackcopy.dng_converter, "convert_groups", fake_convert_groups
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst")]
+    )
+    exit_code, events = _progress_events(stackcopy.run_canon_import, args)
+
+    assert exit_code == 0
+    convert_events = [fields for fields, _ in events if fields.get("phase") == "convert"]
+    assert convert_events, "the convert phase must emit at least one event"
+    last_fields, _ = events[-1]
+    assert last_fields["done"] == last_fields["total"], (
+        "the run must finish with done == total: "
+        f"got done={last_fields['done']} total={last_fields['total']}"
+    )
+
+
+def test_render_phase_is_reported_and_reaches_full_progress(tmp_path, monkeypatch):
+    """Task 5 fix round 1, item 3: the render phase also had zero progress
+    test coverage. Item 2's bug (a bar pinned at 100% for the whole render
+    phase) lived here undetected -- ``operation_total`` never counted the
+    render at all, so ``done`` looked "finished" before the phase even
+    started, and this asserts the fixed version instead reaches
+    done == total only once rendering is actually done.
+    """
+    plan, stack_dir = _one_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
+    )
+
+    def fake_render_stack(helicon, frames, output_path, method=2, **kwargs):
+        return stackcopy.helicon_focus.RenderResult(output_path, rendered=True)
+
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "render_stack", fake_render_stack
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--no-dng", "--render-helicon"]
+    )
+    exit_code, events = _progress_events(stackcopy.run_canon_import, args)
+
+    assert exit_code == 0
+    render_events = [fields for fields, _ in events if fields.get("phase") == "render"]
+    assert render_events, "the render phase must emit at least one event"
+    last_fields, _ = events[-1]
+    assert last_fields["done"] == last_fields["total"], (
+        "the run must finish with done == total: "
+        f"got done={last_fields['done']} total={last_fields['total']}"
+    )
+
+
 # --- Fix round 2, item 3 / item 7 minors -----------------------------------
 
 

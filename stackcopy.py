@@ -3458,10 +3458,23 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
         print("Dry run: nothing was copied or converted.")
         return 0
 
+    # Renders are counted too, but only for stacks Helicon could ever
+    # actually render (>=2 frames -- the same test canon_stack_is_renderable
+    # applies later, once real frame lists exist). Frame *count* alone
+    # decides it, so this can be computed now, before anything is copied,
+    # and it will still agree with the render loop's own check below --
+    # that agreement is what lets `done` reach `total` exactly, instead of
+    # stalling short (an under-count) or hanging at 100% early (an
+    # over-count).
+    render_total = (
+        sum(1 for s in plan.stacks if len(s.frame_sources) >= 2)
+        if args.render_helicon else 0
+    )
     operation_total = (
         len(plan.stacks)
         + sum(len(s.frame_sources) for s in plan.stacks)
         + len(plan.singles)
+        + render_total
     )
     _emit_progress(phase="prepare", done=0, total=operation_total)
 
@@ -3490,13 +3503,19 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
                 conversion_jobs.append((stack.dest_dir, list(stack.frame_sources)))
             else:
                 for source in stack.frame_sources:
+                    frame_dest = _canon_frame_dest(stack, source, False)
                     frame_ok, _ = safe_file_operation(
-                        "copy", source,
-                        _canon_frame_dest(stack, source, False),
+                        "copy", source, frame_dest,
                         "copying", args.force, args.dry_run,
                     )
                     if not frame_ok:
                         failed_stack_dirs.add(stack.dest_dir)
+                    done += 1
+                    _emit_progress(
+                        file=os.path.basename(frame_dest),
+                        phase="copy", done=done, total=operation_total,
+                        role="frames",
+                    )
         except Exception as error:
             # A failed group must never abort the run: report it and move on
             # to the rest of the import.
@@ -3569,8 +3588,31 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
                 f"{helicon_focus.HELICON_ENV}."
             )
             return 1
+
+        def _note_render_progress(name: str) -> None:
+            nonlocal done
+            done += 1
+            _emit_progress(
+                file=name, phase="render", done=done,
+                total=operation_total, role="render",
+            )
+
         for stack in plan.stacks:
+            # Matches render_total's own count exactly (both are frame-count
+            # only, computed before any copy or render is attempted), so
+            # every stack this loop can possibly reach one of `continue`,
+            # the except branch, or the success path for is accounted for
+            # exactly once below -- never zero times (a stall short of
+            # total) and never twice (a total reached early).
+            counted_in_total = len(stack.frame_sources) >= 2
+
             if stack.dest_dir in failed_stack_dirs:
+                # Already-failed work is still finished work: it was
+                # counted in operation_total above (by frame count alone,
+                # before any copy could fail), so it must still increment
+                # done here or the bar stalls short forever.
+                if counted_in_total:
+                    _note_render_progress(os.path.basename(stack.dest_dir))
                 continue
             # The frame list comes from the PLAN, never from listing the
             # folder. Two reasons, both silent-wrong-output bugs:
@@ -3603,6 +3645,8 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
                     f"{', and more' if len(absent) > 3 else ''}); rendering a "
                     "partial stack would produce a silently wrong image"
                 )
+                if counted_in_total:
+                    _note_render_progress(os.path.basename(stack.dest_dir))
                 continue
             if not canon_stack_is_renderable(frames):
                 print(
@@ -3624,11 +3668,9 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
             except Exception as error:
                 render_failures += 1
                 print(f"  Helicon failed: {display_path(output)}: {error}")
+                _note_render_progress(os.path.basename(output))
                 continue
-            _emit_progress(
-                file=os.path.basename(output),
-                phase="render", done=done, total=operation_total, role="render",
-            )
+            _note_render_progress(os.path.basename(output))
             if not result.ok:
                 render_failures += 1
                 print(f"  Helicon failed: {display_path(output)}: {result.error}")
