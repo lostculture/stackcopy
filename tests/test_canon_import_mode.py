@@ -1369,5 +1369,63 @@ class SingleFrameRenderSkipTests(unittest.TestCase):
         self.assertFalse(stackcopy.canon_stack_is_renderable([]))
 
 
+def _run_canon_import_capturing_progress():
+    """Run a one-stack Canon import with progress on, returning sentinel lines."""
+    with tempfile.TemporaryDirectory() as work:
+        source = Path(work) / "108EOSR6"
+        source.mkdir()
+        for name in ("IMG_0001.CR3", "IMG_0002.JPG"):
+            (source / name).write_bytes(b"x" * 32)
+        captured = io.StringIO()
+        args = stackcopy.parse_arguments(
+            ["--canon-import", str(source), str(Path(work) / "out"),
+             "--singles-dir", str(Path(work) / "singles"), "--no-dng"]
+        )
+        with mock.patch.object(stackcopy, "_PROGRESS_ENABLED", True), \
+             mock.patch.object(stackcopy.sys, "stderr", captured), \
+             mock.patch.object(
+                 stackcopy, "read_canon_stack_metadata",
+                 lambda paths: canon_stacks.records_from_exiftool_json(
+                     [{"SourceFile": p,
+                       "SubSecDateTimeOriginal": "2026:07:31 10:44:02.03-04:00",
+                       "FocusBracketingDepthComposite": 1} for p in paths]
+                 ),
+             ):
+            stackcopy.run_canon_import(args)
+    return [
+        ln for ln in captured.getvalue().splitlines()
+        if ln.startswith(gui.PROGRESS_SENTINEL)
+    ]
+
+
+class CanonProgressTests(unittest.TestCase):
+    def test_progress_lines_survive_the_guis_parser(self):
+        """Whatever we emit, the GUI must be able to read it."""
+        captured = io.StringIO()
+        with mock.patch.object(stackcopy, "_PROGRESS_ENABLED", True), \
+             mock.patch.object(stackcopy.sys, "stderr", captured):
+            stackcopy._emit_progress(
+                file="IMG_0040.JPG", phase="copy", done=1, total=27, role="composite"
+            )
+        line = captured.getvalue().strip()
+        self.assertTrue(line.startswith(gui.PROGRESS_SENTINEL))
+        fields, filename = gui.parse_progress(line)
+        self.assertEqual(filename, "IMG_0040.JPG")
+        self.assertEqual(fields["phase"], "copy")
+        self.assertEqual(fields["done"], "1")
+        self.assertEqual(fields["total"], "27")
+
+    def test_canon_import_emits_prepare_and_start(self):
+        lines = _run_canon_import_capturing_progress()
+        phases = [gui.parse_progress(ln)[0].get("phase") for ln in lines]
+        self.assertIn("prepare", phases)
+        self.assertIn("start", phases)
+
+    def test_every_copied_file_is_reported(self):
+        lines = _run_canon_import_capturing_progress()
+        names = [gui.parse_progress(ln)[1] for ln in lines]
+        self.assertIn("IMG_0002.JPG", names)
+
+
 if __name__ == "__main__":
     unittest.main()

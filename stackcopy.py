@@ -3451,13 +3451,26 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
     if ops_for_check:
         confirm_if_low_space(ops_for_check, args.dry_run)
 
+    # A dry run performs no operations, so reporting that it did would be a
+    # lie to the GUI: return before any progress -- including "prepare" --
+    # is ever emitted.
     if args.dry_run:
         print("Dry run: nothing was copied or converted.")
         return 0
 
+    operation_total = (
+        len(plan.stacks)
+        + sum(len(s.frame_sources) for s in plan.stacks)
+        + len(plan.singles)
+    )
+    _emit_progress(phase="prepare", done=0, total=operation_total)
+
     created_dirs: set[str] = set()
     failed_stack_dirs: set[str] = set()
     conversion_jobs: list[tuple[str, list[str]]] = []
+
+    _emit_progress(phase="start", done=0, total=operation_total)
+    done = 0
 
     for stack in plan.stacks:
         try:
@@ -3468,6 +3481,11 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
             )
             if not jpg_ok:
                 failed_stack_dirs.add(stack.dest_dir)
+            done += 1
+            _emit_progress(
+                file=os.path.basename(stack.jpg_dest),
+                phase="copy", done=done, total=operation_total, role="stacked",
+            )
             if converter is not None:
                 conversion_jobs.append((stack.dest_dir, list(stack.frame_sources)))
             else:
@@ -3486,8 +3504,17 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
             print(f"  Failed: {display_path(stack.dest_dir)}: {error}")
 
     if converter is not None and conversion_jobs:
+        def _on_group_converted(result):
+            nonlocal done
+            done += result.converted + result.skipped
+            _emit_progress(
+                file=os.path.basename(result.dest_dir),
+                phase="convert", done=done, total=operation_total, role="frames",
+            )
+
         results = dng_converter.convert_groups(
             converter, conversion_jobs, workers=args.dng_jobs,
+            on_progress=_on_group_converted,
         )
         for result in results:
             if not result.ok:
@@ -3505,6 +3532,11 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
             )
             if not single_ok:
                 failed_singles += 1
+            done += 1
+            _emit_progress(
+                file=os.path.basename(dest),
+                phase="copy", done=done, total=operation_total, role="single",
+            )
         except Exception as error:
             failed_singles += 1
             print(f"  Failed: {display_path(dest)}: {error}")
@@ -3593,6 +3625,10 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
                 render_failures += 1
                 print(f"  Helicon failed: {display_path(output)}: {error}")
                 continue
+            _emit_progress(
+                file=os.path.basename(output),
+                phase="render", done=done, total=operation_total, role="render",
+            )
             if not result.ok:
                 render_failures += 1
                 print(f"  Helicon failed: {display_path(output)}: {result.error}")
