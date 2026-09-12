@@ -586,6 +586,21 @@ class CanonImportArgsTests(unittest.TestCase):
                      "--helicon-radius", "--helicon-smoothing"):
             self.assertNotIn(flag, args)
 
+    def test_render_defaults_are_not_passed_explicitly(self):
+        """The tuning guards only run once ``render=True`` enters the branch.
+
+        Leaving ``render`` at its default in the sibling test never reaches
+        the inner ``!=`` guards at all, so it cannot exercise them. This
+        drives render=True with every tuning value left at its default to
+        prove the nested guards - not just the outer one - suppress them.
+        """
+        args = gui.canon_import_args(
+            "SRC", "DST", "SINGLES", render=True, method=2, radius=8, smoothing=4
+        )
+        self.assertIn("--render-helicon", args)
+        for flag in ("--helicon-method", "--helicon-radius", "--helicon-smoothing"):
+            self.assertNotIn(flag, args)
+
     def test_non_default_tuning_is_passed(self):
         args = gui.canon_import_args(
             "SRC", "DST", "SINGLES", render=True, method=0, radius=6, smoothing=7
