@@ -1,15 +1,19 @@
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 import canon_stacks
 import stackcopy
+import stackcopy_gui as gui  # noqa: E402  (for the validator round-trip test)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,6 +24,32 @@ FIXTURE = Path(__file__).parent / "fixtures" / "canon_108eosr6.json"
 # because IMG_0014's stack spans the folder rollover). Only 108EOSR6 is a
 # target: 107EOSR6 is borrowable context, never a source of its own stacks.
 TARGET_FOLDERS = {"108EOSR6"}
+
+
+def _one_stack_and_single_plan():
+    """A plan with one 25-frame stack and one loose CR3.
+
+    Named distinctly from the unrelated ``_one_stack_plan(tmp_path)`` fixture
+    used by the Task 11 Helicon Focus tests further down this file (a
+    real-filesystem, one-frame stack with no singles) -- a module-level
+    `def` would otherwise silently shadow whichever of the two is defined
+    later, breaking the other's callers.
+    """
+    frames = tuple(
+        os.path.join("108EOSR6", f"IMG_{n:04d}.CR3") for n in range(15, 40)
+    )
+    stack = stackcopy.CanonPlannedStack(
+        dest_dir=os.path.join(r"F:\Stacked", "2026-07-31", "IMG_0040"),
+        jpg_src=os.path.join("108EOSR6", "IMG_0040.JPG"),
+        jpg_dest=os.path.join(r"F:\Stacked", "2026-07-31", "IMG_0040", "IMG_0040.JPG"),
+        frame_sources=frames,
+    )
+    return stackcopy.CanonImportPlan(
+        stacks=(stack,),
+        singles=(os.path.join(r"F:\Singles", "2026-07-31", "IMG_0067.CR3"),),
+        single_sources=(os.path.join("108EOSR6", "IMG_0067.CR3"),),
+        unresolved=(),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -1174,6 +1204,115 @@ class Cr3CountsAsRawTests(unittest.TestCase):
             # Without .cr3 in RAW_EXTENSIONS, IMG_0001.JPG looks unpaired too
             # and both JPGs are copied.
             self.assertEqual(copied, ["IMG_0002.JPG"])
+
+
+class CanonPlanJsonTests(unittest.TestCase):
+    def test_payload_fields_and_invariant(self):
+        payload = stackcopy.canon_plan_payload(
+            _one_stack_and_single_plan(),  # helper defined in Step 3 of this task
+            dest_dir=r"F:\Stacked",
+            singles_dir=r"F:\Singles",
+            canon_frames_detected=26,
+        )
+        self.assertEqual(payload["mode"], "canon-import")
+        self.assertEqual(payload["stacks"], 1)
+        self.assertEqual(payload["stacked_outputs"], 1)
+        self.assertEqual(payload["stack_inputs"], 25)
+        self.assertEqual(payload["others"], 1)
+        self.assertEqual(
+            payload["total"],
+            payload["stacked_outputs"] + payload["stack_inputs"] + payload["others"],
+        )
+        self.assertEqual(payload["dest_stacks"], r"F:\Stacked")
+        self.assertEqual(payload["dest_singles"], r"F:\Singles")
+        self.assertEqual(payload["canon_frames_detected"], 26)
+        self.assertEqual(payload["unresolved"], 0)
+        self.assertEqual(payload["stackcopy_version"], stackcopy.STACKCOPY_VERSION)
+
+    def test_payload_survives_the_guis_own_validator(self):
+        """The GUI rejects a malformed plan; a Canon plan must not look malformed."""
+        payload = stackcopy.canon_plan_payload(
+            _one_stack_and_single_plan(), r"F:\Stacked", r"F:\Singles", 26
+        )
+        parsed = gui.parse_plan_json(json.dumps(payload))
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["stacks"], 1)
+
+    def test_plan_json_is_accepted_with_canon_import(self):
+        parser = stackcopy.build_parser()
+        args = parser.parse_args(
+            ["--canon-import", "src", "dst", "--plan-json"]
+        )
+        self.assertTrue(args.plan_json)
+
+    def test_plan_json_still_rejected_for_other_modes(self):
+        parser = stackcopy.build_parser()
+        with self.assertRaises(SystemExit):
+            stackcopy.validate_plan_json_mode(
+                parser, parser.parse_args(["--rename", "somedir", "--plan-json"])
+            )
+
+
+class CanonPlanJsonStdoutRoutingTests(unittest.TestCase):
+    """--plan-json's payload must reach the real stdout, not stderr.
+
+    main() redirects sys.stdout to sys.stderr for the duration of a
+    --plan-json run, so every incidental print() during scan/plan stays off
+    the pipe a caller is about to parse as JSON -- then restores the real
+    stream right before printing the payload itself. --lightroomimport does
+    that restore explicitly (``sys.stdout = plan_json_stdout``); a
+    --canon-import implementation that just does ``print(json.dumps(...))``
+    without the same restore prints straight into the *redirected* stdout,
+    i.e. the real stderr, where the GUI parsing --plan-json's stdout would
+    never see it. This drives the whole run through main() itself (not
+    run_canon_import() directly) so it exercises that redirect/restore, the
+    same way tests/test_plan_json_and_progress_roles.py does for
+    --lightroomimport.
+    """
+
+    def test_payload_reaches_real_stdout_through_main(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src" / "100EOSR6"
+            src.mkdir(parents=True)
+            (src / "IMG_0067.CR3").write_bytes(b"frame")
+            dest = Path(tmp) / "dst"
+
+            records = [
+                canon_stacks.CanonFrame("100EOSR6", 67, ".cr3", "IMG_0067.CR3"),
+            ]
+            output = io.StringIO()
+            exit_code = None
+            with (
+                mock.patch.object(
+                    stackcopy, "read_canon_stack_metadata", lambda paths: records
+                ),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "stackcopy.py",
+                        "--canon-import",
+                        str(src),
+                        str(dest),
+                        "--plan-json",
+                        "--no-dng",
+                    ],
+                ),
+                redirect_stdout(output),
+            ):
+                try:
+                    stackcopy.main()
+                except SystemExit as exc:
+                    exit_code = exc.code if isinstance(exc.code, int) else 1
+
+        self.assertEqual(exit_code, 0)
+        captured = output.getvalue()
+        lines = captured.strip().splitlines()
+        self.assertEqual(len(lines), 1, captured)
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["mode"], "canon-import")
+        self.assertEqual(payload["stacks"], 0)
+        self.assertEqual(payload["others"], 1)
 
 
 if __name__ == "__main__":

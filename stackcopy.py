@@ -3161,6 +3161,39 @@ def build_canon_import_plan(
     )
 
 
+def canon_plan_payload(
+    plan, dest_dir: str, singles_dir: str, canon_frames_detected: int
+) -> dict:
+    """Describe a Canon import in the same shape --lightroomimport uses.
+
+    The GUI validates any plan it receives, including the arithmetic
+    total == stacked_outputs + stack_inputs + others.  Canon satisfies it
+    naturally: every CR3 is either a stack frame or a loose file, and every
+    composite JPG is one stacked output.
+    """
+    frame_count = sum(len(stack.frame_sources) for stack in plan.stacks)
+    dates = sorted({os.path.basename(os.path.dirname(s.dest_dir)) for s in plan.stacks})
+    dest_dirs = sorted({os.path.dirname(s.dest_dir) for s in plan.stacks})
+    return {
+        "mode": "canon-import",
+        "stackcopy_version": STACKCOPY_VERSION,
+        "total": len(plan.stacks) + frame_count + len(plan.singles),
+        "bytes": 0,
+        "stacks": len(plan.stacks),
+        "stacked_outputs": len(plan.stacks),
+        "stack_inputs": frame_count,
+        "others": len(plan.singles),
+        "unresolved": len(plan.unresolved),
+        "canon_frames_detected": canon_frames_detected,
+        "newest_date": dates[-1] if dates else "",
+        "dest_stacks": dest_dir,
+        "dest_singles": singles_dir,
+        "source_subdirs_scanned": [],
+        "dest_dirs": dest_dirs,
+        "dest_dates": dates,
+    }
+
+
 def _canon_scan_targets(source_dir: str) -> tuple[str, dict[str, str]]:
     """Resolve the scan root and the camera folder(s) to import from it.
 
@@ -3248,7 +3281,7 @@ def _canon_frame_dest(
     return os.path.join(stack.dest_dir, name)
 
 
-def run_canon_import(args) -> int:
+def run_canon_import(args, plan_json_stdout=None) -> int:
     """Execute --canon-import: scan, plan, preflight, copy, convert, report.
 
     Order matters: the plan is built and reported before anything is
@@ -3268,6 +3301,15 @@ def run_canon_import(args) -> int:
     was scanned, so the reported plan is always the actual authority on
     what happens next (a caller substituting its own plan via monkeypatch
     still gets a faithful run).
+
+    ``plan_json_stdout`` is the real stdout stream saved by ``main()`` before
+    it redirected ``sys.stdout`` to ``sys.stderr`` for the duration of a
+    --plan-json run (so every incidental print() above stays off the pipe a
+    caller is about to parse as JSON). When --plan-json is set, the payload
+    below is written there instead of to (redirected) ``sys.stdout``. A
+    caller that invokes this function directly, without going through that
+    redirect (e.g. a unit test using ``capsys``), leaves this ``None`` and
+    the payload falls back to whatever ``sys.stdout`` already is.
     """
     source_dir = normalize_path(args.canon_import[0])
     dest_dir = normalize_path(args.canon_import[1])
@@ -3310,6 +3352,18 @@ def run_canon_import(args) -> int:
         records, dest_dir, singles_dir, source_root,
         target_folders=set(target_folders),
     )
+
+    if getattr(args, "plan_json", False):
+        frames_seen = sum(
+            1 for path in paths if os.path.splitext(path)[1].lower() == ".cr3"
+        )
+        print(
+            json.dumps(
+                canon_plan_payload(plan, dest_dir, singles_dir, frames_seen)
+            ),
+            file=plan_json_stdout or sys.stdout,
+        )
+        return 0
 
     frame_total = sum(len(stack.frame_sources) for stack in plan.stacks)
     print(
@@ -3720,8 +3774,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--plan-json",
         action="store_true",
         help=(
-            "Scan and plan --lightroomimport without changing files, then emit "
-            "one machine-readable JSON object."
+            "Scan and plan --lightroomimport or --canon-import without "
+            "changing files, then emit one machine-readable JSON object."
         ),
     )
 
@@ -3805,6 +3859,20 @@ def parse_arguments(
     return parser.parse_args(argv)
 
 
+def validate_plan_json_mode(parser, args) -> None:
+    """--plan-json describes an import, so it belongs to the import modes.
+
+    Both --lightroomimport and --canon-import emit the same payload shape;
+    every other mode has no plan to describe.
+    """
+    if not args.plan_json:
+        return
+    if args.lightroomimport is None and not args.canon_import:
+        parser.error(
+            "--plan-json can only be used with --lightroomimport or --canon-import."
+        )
+
+
 def main():
     """Main program entry point."""
     # --- 0. Execution Tracking & Summary Statistics ---
@@ -3861,8 +3929,7 @@ def main():
     # emitted below.
     plan_json_stdout = None
     if args.plan_json:
-        if args.lightroomimport is None:
-            parser.error("--plan-json can only be used with --lightroomimport.")
+        validate_plan_json_mode(parser, args)
         args.dry_run = True
         plan_json_stdout = sys.stdout
         sys.stdout = sys.stderr
@@ -4046,7 +4113,7 @@ def main():
         # Fully self-contained: scans, plans, preflights, and executes on
         # its own, then exits -- none of the shared copy/rename/lightroom
         # machinery below applies to it.
-        sys.exit(run_canon_import(args))
+        sys.exit(run_canon_import(args, plan_json_stdout=plan_json_stdout))
     else:  # --stackcopy mode
         operation_mode = "stackcopy"
         work_dir = normalize_path(args.stackcopy)
