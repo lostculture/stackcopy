@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import stackcopy
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -564,4 +566,53 @@ class DetectCanonModeTests(unittest.TestCase):
     def test_zero_cr3_reported_explicitly_does_not_tick(self):
         ticked, _ = gui.detect_canon_mode({"canon_frames_detected": 0})
         self.assertFalse(ticked)
+
+
+class CanonImportArgsTests(unittest.TestCase):
+    def test_minimal_command_is_positional_only(self):
+        args = gui.canon_import_args("SRC", "DST", "SINGLES")
+        self.assertEqual(args[:4], ["--canon-import", "SRC", "DST", "--singles-dir"])
+        self.assertIn("SINGLES", args)
+        for flag in ("--no-dng", "--render-helicon", "--dng-jobs",
+                     "--helicon-method", "--dry", "--verbose"):
+            self.assertNotIn(flag, args)
+
+    def test_defaults_are_not_passed_explicitly(self):
+        """Passing the CLI's own defaults would pin values it may retune."""
+        args = gui.canon_import_args(
+            "SRC", "DST", "SINGLES", dng_jobs=1, method=2, radius=8, smoothing=4
+        )
+        for flag in ("--dng-jobs", "--helicon-method",
+                     "--helicon-radius", "--helicon-smoothing"):
+            self.assertNotIn(flag, args)
+
+    def test_non_default_tuning_is_passed(self):
+        args = gui.canon_import_args(
+            "SRC", "DST", "SINGLES", render=True, method=0, radius=6, smoothing=7
+        )
+        self.assertIn("--render-helicon", args)
+        self.assertIn("--helicon-method", args)
+        self.assertEqual(args[args.index("--helicon-method") + 1], "0")
+
+    def test_dng_off_maps_to_no_dng(self):
+        self.assertIn("--no-dng", gui.canon_import_args("S", "D", "G", dng=False))
+
+    def test_plan_json_and_dry_are_separate_switches(self):
+        args = gui.canon_import_args("S", "D", "G", plan_json=True)
+        self.assertIn("--plan-json", args)
+        self.assertNotIn("--dry", args)
+
+    def test_every_built_command_is_accepted_by_the_cli(self):
+        """A GUI that builds an argv the CLI rejects is broken by construction."""
+        parser = stackcopy.build_parser()
+        for kwargs in (
+            {},
+            {"dry": True, "verbose": True},
+            {"dng": False},
+            {"render": True, "method": 1, "radius": 5, "smoothing": 3},
+            {"plan_json": True},
+            {"dng_jobs": 8},
+        ):
+            with self.subTest(**kwargs):
+                parser.parse_args(gui.canon_import_args("S", "D", "G", **kwargs))
 

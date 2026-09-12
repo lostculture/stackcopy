@@ -270,6 +270,54 @@ def detect_canon_mode(plan: dict[str, object] | None) -> tuple[bool, str]:
     return True, f"found {count} CR3 {noun}"
 
 
+CANON_DEFAULT_DNG_JOBS = 1
+CANON_DEFAULT_METHOD = 2
+CANON_DEFAULT_RADIUS = 8
+CANON_DEFAULT_SMOOTHING = 4
+
+
+def canon_import_args(
+    source: str,
+    dest: str,
+    singles: str,
+    *,
+    plan_json: bool = False,
+    dry: bool = False,
+    verbose: bool = False,
+    dng: bool = True,
+    dng_jobs: int = CANON_DEFAULT_DNG_JOBS,
+    render: bool = False,
+    method: int = CANON_DEFAULT_METHOD,
+    radius: int = CANON_DEFAULT_RADIUS,
+    smoothing: int = CANON_DEFAULT_SMOOTHING,
+) -> list[str]:
+    """Build the CLI arguments for a Canon import.
+
+    Values matching the CLI's own defaults are left out rather than passed:
+    the GUI should not pin a number the CLI may later retune.
+    """
+    args = ["--canon-import", source, dest, "--singles-dir", singles]
+    if plan_json:
+        args.append("--plan-json")
+    if dry:
+        args.append("--dry")
+    if verbose:
+        args.append("--verbose")
+    if not dng:
+        args.append("--no-dng")
+    if dng_jobs != CANON_DEFAULT_DNG_JOBS:
+        args += ["--dng-jobs", str(dng_jobs)]
+    if render:
+        args.append("--render-helicon")
+        if method != CANON_DEFAULT_METHOD:
+            args += ["--helicon-method", str(method)]
+        if radius != CANON_DEFAULT_RADIUS:
+            args += ["--helicon-radius", str(radius)]
+        if smoothing != CANON_DEFAULT_SMOOTHING:
+            args += ["--helicon-smoothing", str(smoothing)]
+    return args
+
+
 def exiftool_status_display(
     plan: dict[str, object] | None,
 ) -> tuple[str, str, bool] | None:
