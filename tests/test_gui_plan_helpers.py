@@ -443,6 +443,14 @@ class TerminalSummaryTests(unittest.TestCase):
         self.assertEqual(parsed, {"problems": 0, "imported": 348})
 
 
+class PlanRowsComeFromTheHelperTests(unittest.TestCase):
+    def test_the_gui_module_has_no_second_copy_of_the_row_wording(self):
+        """The row strings must live in one place, or the modes drift apart."""
+        source = (ROOT / "stackcopy_gui.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count("finished stacked photos - renamed"), 1)
+        self.assertEqual(source.count("single shots and videos - names untouched"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 

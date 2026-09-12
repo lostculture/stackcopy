@@ -294,6 +294,21 @@ def canon_method_index(value: str) -> int:
     return index
 
 
+def canon_field_int(value: str, default: int) -> int:
+    """Parse a free-typed Canon/Helicon entry field, tolerating garbage.
+
+    ``canon_dng_jobs_var``, ``canon_radius_var`` and ``canon_smoothing_var``
+    are plain ``StringVar``\\ s a photographer can type into directly. A
+    stray letter, a blank field, or leftover whitespace must fall back to
+    the default quietly - raising ``ValueError`` the moment someone clicks
+    Import is the worst possible time to discover a typo.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def canon_import_args(
     source: str,
     dest: str,
@@ -1683,12 +1698,21 @@ class StackcopyGUI(ctk.CTk):
         self._plan_slow_after = self.after(
             2000, lambda: self._show_slow_plan_scan(generation)
         )
-        args = ["--lightroomimport", source, "--plan-json"]
-        if not self.detect_stacks_var.get():
-            args.append("--no-stack-detection")
-        command, env = cli_command(args)
-        env["STACKCOPY_LIGHTROOM_IMPORT_DIR"] = self.dst_var.get().strip()
-        env["STACKCOPY_STACK_INPUT_DIR"] = self.stk_var.get().strip()
+        if self.canon_mode_var.get():
+            args = canon_import_args(
+                source,
+                self.dst_var.get().strip(),
+                self.stk_var.get().strip(),
+                plan_json=True,
+            )
+            command, env = cli_command(args)
+        else:
+            args = ["--lightroomimport", source, "--plan-json"]
+            if not self.detect_stacks_var.get():
+                args.append("--no-stack-detection")
+            command, env = cli_command(args)
+            env["STACKCOPY_LIGHTROOM_IMPORT_DIR"] = self.dst_var.get().strip()
+            env["STACKCOPY_STACK_INPUT_DIR"] = self.stk_var.get().strip()
         threading.Thread(
             target=self._plan_worker,
             args=(generation, command, env),
@@ -1800,55 +1824,26 @@ class StackcopyGUI(ctk.CTk):
             if total is not None
             else "Where these files will land"
         )
-        output_count = int(plan["stacked_outputs"]) if plan else None
-        input_count = int(plan["stack_inputs"]) if plan else None
-        other_count = int(plan["others"]) if plan else None
-        example = (
-            str(plan.get("stacked_output_example", "a name like P8081885 stacked.jpg"))
-            if plan
-            else ""
-        )
-        generic_output = "Finished stacked photos - renamed with 'stacked' added"
-        generic_output += " to the name"
-        self.plan_headline_vars["stack_output"].set(
-            (
-                f"{output_count} finished stacked photos - renamed {example}"
-                if output_count is not None
-                else generic_output
-            )
-        )
-        self.plan_headline_vars["stack_input"].set(
-            (
-                f"{input_count} frames that fed those stacks - kept in case you want "
-                "to stack the RAWs yourself"
-                if input_count is not None
-                else (
-                    "Frames that fed those stacks - kept in case you want to "
-                    "stack the RAWs yourself"
-                )
-            )
-        )
-        self.plan_headline_vars["other"].set(
-            (
-                f"{other_count} single shots and videos - names untouched, dated "
-                "folders "
-                "as Lightroom would make them"
-                if other_count is not None
-                else (
-                    "Single shots and videos - names untouched, dated folders as "
-                    "Lightroom would make them"
-                )
-            )
-        )
+        stacked_label, frames_label, other_label = plan_row_labels(plan)
+        self.plan_headline_vars["stack_output"].set(stacked_label)
+        self.plan_headline_vars["stack_input"].set(frames_label)
+        self.plan_headline_vars["other"].set(other_label)
         if plan:
-            lightroom_path = str(plan.get("dest_lightroom") or self.dst_var.get())
-            stack_path = str(plan.get("dest_stack_input") or self.stk_var.get())
+            if plan_mode(plan) == CANON_MODE:
+                first_path = str(plan.get("dest_stacks") or self.dst_var.get())
+                second_path = first_path
+                third_path = str(plan.get("dest_singles") or self.stk_var.get())
+            else:
+                first_path = str(plan.get("dest_lightroom") or self.dst_var.get())
+                second_path = str(plan.get("dest_stack_input") or self.stk_var.get())
+                third_path = first_path
         else:
-            lightroom_path = self.dst_var.get()
-            stack_path = self.stk_var.get()
-        self.plan_path_vars["stack_output"].set(lightroom_path)
-        self.plan_path_vars["stack_input"].set(stack_path)
-        self.plan_path_vars["other"].set(lightroom_path)
+            first_path = self.dst_var.get()
+            second_path = self.stk_var.get()
+            third_path = first_path
+        self.plan_path_vars["stack_output"].set(first_path)
+        self.plan_path_vars["stack_input"].set(second_path)
+        self.plan_path_vars["other"].set(third_path)
         self._refresh_dated_folders()
         self.start_btn.configure(
             text=import_button_label(
@@ -1972,17 +1967,36 @@ class StackcopyGUI(ctk.CTk):
         if paths is None:
             return
         source, lightroom, stack_input = paths
-        args = ["--lightroomimport", source]
-        if preview:
-            args.append("--dry")
-        if self.verbose_var.get():
-            args.append("--verbose")
-        if not self.detect_stacks_var.get():
-            args.append("--no-stack-detection")
-        if self.debug_stacks_var.get():
-            args.append("--debug-stacks")
-        if self.mode_var.get() == COPY_MODE:
-            args.append("--leave-on-card")
+        if self.canon_mode_var.get():
+            args = canon_import_args(
+                source, lightroom, stack_input,
+                dry=preview,
+                verbose=self.verbose_var.get(),
+                dng=self.canon_dng_var.get(),
+                dng_jobs=canon_field_int(
+                    self.canon_dng_jobs_var.get(), CANON_DEFAULT_DNG_JOBS
+                ),
+                render=self.canon_render_var.get(),
+                method=canon_method_index(self.canon_method_var.get()),
+                radius=canon_field_int(
+                    self.canon_radius_var.get(), CANON_DEFAULT_RADIUS
+                ),
+                smoothing=canon_field_int(
+                    self.canon_smoothing_var.get(), CANON_DEFAULT_SMOOTHING
+                ),
+            )
+        else:
+            args = ["--lightroomimport", source]
+            if preview:
+                args.append("--dry")
+            if self.verbose_var.get():
+                args.append("--verbose")
+            if not self.detect_stacks_var.get():
+                args.append("--no-stack-detection")
+            if self.debug_stacks_var.get():
+                args.append("--debug-stacks")
+            if self.mode_var.get() == COPY_MODE:
+                args.append("--leave-on-card")
         self._pending = (args, lightroom, stack_input, preview)
         self._assume_yes = False
         self._launch()
@@ -1994,8 +2008,9 @@ class StackcopyGUI(ctk.CTk):
         env["STACKCOPY_PROGRESS"] = "1"
         env["STACKCOPY_LOW_SPACE_REPORT"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
-        env["STACKCOPY_LIGHTROOM_IMPORT_DIR"] = lightroom
-        env["STACKCOPY_STACK_INPUT_DIR"] = stack_input
+        if not self.canon_mode_var.get():
+            env["STACKCOPY_LIGHTROOM_IMPORT_DIR"] = lightroom
+            env["STACKCOPY_STACK_INPUT_DIR"] = stack_input
         env.pop("STACKCOPY_ASSUME_YES", None)
         if self._assume_yes:
             env["STACKCOPY_ASSUME_YES"] = "1"
@@ -2345,19 +2360,23 @@ class StackcopyGUI(ctk.CTk):
             )
 
     def _show_zero_plan_rows(self) -> None:
-        """Keep the plan visible and explicit when the scan finds no media."""
+        """Keep the plan visible and explicit when the scan finds no media.
+
+        Worded through ``plan_row_labels`` like every other plan row, so a
+        Canon card with nothing on it is not described in Olympus terms -
+        and so the row wording lives in exactly one place in this module.
+        """
         self.plan_heading_var.set("Where these 0 files will land")
-        self.plan_headline_vars["stack_output"].set(
-            "0 finished stacked photos - renamed with 'stacked' added to the name"
-        )
-        self.plan_headline_vars["stack_input"].set(
-            "0 frames that fed those stacks - kept in case you want to stack "
-            "the RAWs yourself"
-        )
-        self.plan_headline_vars["other"].set(
-            "0 single shots and videos - names untouched, dated folders as "
-            "Lightroom would make them"
-        )
+        zero_plan = {
+            "mode": plan_mode(self._plan),
+            "stacked_outputs": 0,
+            "stack_inputs": 0,
+            "others": 0,
+        }
+        stacked_label, frames_label, other_label = plan_row_labels(zero_plan)
+        self.plan_headline_vars["stack_output"].set(stacked_label)
+        self.plan_headline_vars["stack_input"].set(frames_label)
+        self.plan_headline_vars["other"].set(other_label)
         self._dated_folders_open = False
         self.dated_summary_btn.grid_remove()
         self.dated_list_label.grid_remove()
