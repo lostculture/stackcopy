@@ -276,6 +276,24 @@ CANON_DEFAULT_RADIUS = 8
 CANON_DEFAULT_SMOOTHING = 4
 
 
+def canon_method_index(value: str) -> int:
+    """The Helicon method index for a persisted value, tolerating garbage.
+
+    ``gui-state.json`` is a file the README tells photographers to hand-edit
+    (to flip ``update_check_enabled``), so a typo in a neighbouring key -
+    ``canon_method`` set to ``"7"``, ``"-1"``, or something non-numeric - is a
+    realistic way to arrive here.  That must reset quietly to the default
+    method, not keep the window from opening at all.
+    """
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        return CANON_DEFAULT_METHOD
+    if index not in (0, 1, 2):
+        return CANON_DEFAULT_METHOD
+    return index
+
+
 def canon_import_args(
     source: str,
     dest: str,
@@ -885,6 +903,7 @@ class StackcopyGUI(ctk.CTk):
         self.src_var.trace_add("write", lambda *_: self._on_path_changed())
         self.dst_var.trace_add("write", lambda *_: self._on_path_changed())
         self.stk_var.trace_add("write", lambda *_: self._on_path_changed())
+        self._bind_canon_field_saves()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_queue)
         self.after(150, self._schedule_plan_scan)
@@ -1259,7 +1278,9 @@ class StackcopyGUI(ctk.CTk):
             values=["A", "B", "C"],
             command=self._on_helicon_method_changed,
         )
-        self.helicon_method.set(["A", "B", "C"][int(self.canon_method_var.get())])
+        method_index = canon_method_index(self.canon_method_var.get())
+        self.canon_method_var.set(str(method_index))
+        self.helicon_method.set(["A", "B", "C"][method_index])
         self.helicon_method.grid(row=1, column=1, sticky="w", padx=(22, 0),
                                  pady=(10, 0))
         self.helicon_radius = ctk.CTkEntry(
@@ -1557,6 +1578,19 @@ class StackcopyGUI(ctk.CTk):
         self._plan = None
         self._refresh_idle_plan()
         self._schedule_plan_scan()
+
+    def _bind_canon_field_saves(self) -> None:
+        """Persist the three free-typed Canon/Helicon fields as they change.
+
+        These entries have no checkbox or button of their own to trigger a
+        save, so - like the path fields above - they need their own trace.
+        Without it a value typed here and never followed by some other
+        control only survives a clean window close.
+        """
+        for variable in (
+            self.canon_dng_jobs_var, self.canon_radius_var, self.canon_smoothing_var
+        ):
+            variable.trace_add("write", lambda *_: self._schedule_save())
 
     def _on_canon_mode_changed(self) -> None:
         self._save_current_defaults()

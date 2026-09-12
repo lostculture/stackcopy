@@ -958,3 +958,127 @@ class CanonModeChangeTests(unittest.TestCase):
         )
         gui.StackcopyGUI._on_canon_mode_changed(target)
         self.assertEqual(calls, ["save", "refresh", "scan"])
+
+
+class CanonMethodIndexTests(unittest.TestCase):
+    """``canon_method_index`` tolerates whatever a hand-edited state file holds."""
+
+    def test_valid_indices_pass_through_unchanged(self):
+        self.assertEqual(gui.canon_method_index("0"), 0)
+        self.assertEqual(gui.canon_method_index("1"), 1)
+        self.assertEqual(gui.canon_method_index("2"), 2)
+
+    def test_out_of_range_and_non_numeric_values_fall_back_to_the_default(self):
+        for bad in ("7", "-1", "banana"):
+            self.assertEqual(gui.canon_method_index(bad), gui.CANON_DEFAULT_METHOD)
+
+
+class CanonMethodConstructionTests(unittest.TestCase):
+    """A garbage persisted ``canon_method`` must not stop the window opening."""
+
+    def fake_ctk(self, log):
+        class Widget:
+            def __init__(self, parent=None, **kwargs):
+                self.parent = parent
+                self.kwargs = kwargs
+                self.gridded = False
+                log.append(("create", type(self).__name__, kwargs.get("text")))
+
+            def grid(self, **kwargs):
+                self.gridded = True
+
+            def grid_remove(self):
+                self.gridded = False
+
+            def grid_columnconfigure(self, *a, **k):
+                pass
+
+            def configure(self, **kwargs):
+                self.kwargs.update(kwargs)
+
+        class SegmentedButton(Widget):
+            def set(self, value):
+                self.value = value
+
+        names = ("CTkFrame", "CTkButton", "CTkCheckBox", "CTkEntry")
+        namespace = {name: type(name, (Widget,), {}) for name in names}
+        namespace["CTkSegmentedButton"] = SegmentedButton
+        return SimpleNamespace(**namespace)
+
+    def build_actions(self, canon_method_value):
+        log = []
+        fake = self.fake_ctk(log)
+
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        target = SimpleNamespace(
+            body=object(),
+            _advanced_open=True,
+            verbose_var=SimpleNamespace(get=lambda: False),
+            detect_stacks_var=SimpleNamespace(get=lambda: True),
+            debug_stacks_var=SimpleNamespace(get=lambda: False),
+            canon_render_var=SimpleNamespace(get=lambda: False),
+            canon_method_var=Var(canon_method_value),
+            canon_radius_var=SimpleNamespace(get=lambda: "8"),
+            canon_smoothing_var=SimpleNamespace(get=lambda: "4"),
+            _text_button=lambda parent, text, command: fake.CTkButton(
+                parent, text=text, command=command
+            ),
+            _toggle_advanced=lambda: None,
+            _save_current_defaults=lambda: None,
+            _on_detection_changed=lambda: None,
+            _on_helicon_toggle=lambda: None,
+            _on_helicon_method_changed=lambda value: None,
+            _start=lambda preview: None,
+        )
+        with mock.patch.object(gui, "ctk", fake):
+            gui.StackcopyGUI._build_actions(target)
+        return target
+
+    def test_a_valid_persisted_method_sets_the_matching_letter(self):
+        target = self.build_actions("1")
+        self.assertEqual(target.helicon_method.value, "B")
+        self.assertEqual(target.canon_method_var.value, "1")
+
+    def test_bad_persisted_values_fall_back_instead_of_crashing_construction(self):
+        for bad in ("7", "-1", "banana"):
+            target = self.build_actions(bad)
+            self.assertEqual(target.helicon_method.value, "C")
+            self.assertEqual(target.canon_method_var.value, "2")
+
+
+class CanonFieldSaveWiringTests(unittest.TestCase):
+    """The three free-typed fields must save on their own, like the path fields."""
+
+    class FakeVar:
+        def __init__(self):
+            self.callbacks = []
+
+        def trace_add(self, mode, callback):
+            self.callbacks.append((mode, callback))
+
+        def fire(self):
+            for _mode, callback in self.callbacks:
+                callback()
+
+    def test_typing_in_any_of_the_three_fields_schedules_a_save(self):
+        calls = []
+        target = SimpleNamespace(
+            canon_dng_jobs_var=self.FakeVar(),
+            canon_radius_var=self.FakeVar(),
+            canon_smoothing_var=self.FakeVar(),
+            _schedule_save=lambda: calls.append("scheduled"),
+        )
+        gui.StackcopyGUI._bind_canon_field_saves(target)
+        target.canon_dng_jobs_var.fire()
+        target.canon_radius_var.fire()
+        target.canon_smoothing_var.fire()
+        self.assertEqual(calls, ["scheduled", "scheduled", "scheduled"])
