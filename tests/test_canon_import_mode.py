@@ -12,6 +12,7 @@ from unittest import mock
 import pytest
 
 import canon_stacks
+import helicon_focus
 import stackcopy
 import stackcopy_gui as gui  # noqa: E402  (for the validator round-trip test)
 
@@ -31,7 +32,7 @@ def _one_stack_and_single_plan():
 
     Named distinctly from the unrelated ``_one_stack_plan(tmp_path)`` fixture
     used by the Task 11 Helicon Focus tests further down this file (a
-    real-filesystem, one-frame stack with no singles) -- a module-level
+    real-filesystem, two-frame stack with no singles) -- a module-level
     `def` would otherwise silently shadow whichever of the two is defined
     later, breaking the other's callers.
     """
@@ -656,10 +657,16 @@ def test_no_adjacent_folder_proceeds_normally(tmp_path, monkeypatch, capsys):
 
 
 def _one_stack_plan(tmp_path):
-    """A single real one-frame stack, with real bytes to copy on disk."""
+    """A single real two-frame stack, with real bytes to copy on disk.
+
+    Two frames, not one: a one-frame stack is skipped rather than rendered
+    (see SingleFrameRenderSkipTests), so a fixture meant to exercise
+    rendering needs at least two frames to remain a renderable stack.
+    """
     src = tmp_path / "src"
     src.mkdir(exist_ok=True)
     (src / "IMG_0001.CR3").write_bytes(b"frame-one")
+    (src / "IMG_0002.CR3").write_bytes(b"frame-two")
     (src / "IMG_0001.JPG").write_bytes(b"composite-one")
     stack_dir = tmp_path / "dst" / "2026-01-01" / "IMG_0001"
     plan = stackcopy.CanonImportPlan(
@@ -668,7 +675,9 @@ def _one_stack_plan(tmp_path):
                 dest_dir=str(stack_dir),
                 jpg_src=str(src / "IMG_0001.JPG"),
                 jpg_dest=str(stack_dir / "IMG_0001.JPG"),
-                frame_sources=(str(src / "IMG_0001.CR3"),),
+                frame_sources=(
+                    str(src / "IMG_0001.CR3"), str(src / "IMG_0002.CR3"),
+                ),
             ),
         ),
         singles=(), single_sources=(), unresolved=(),
@@ -677,13 +686,19 @@ def _one_stack_plan(tmp_path):
 
 
 def _two_stack_plan(tmp_path):
-    """Two independent real one-frame stacks, with real bytes on disk."""
+    """Two independent real two-frame stacks, with real bytes on disk.
+
+    Two frames per stack, not one: a one-frame stack is skipped rather than
+    rendered (see SingleFrameRenderSkipTests), so fixtures meant to exercise
+    rendering need at least two frames each to remain renderable.
+    """
     src = tmp_path / "src"
     src.mkdir(exist_ok=True)
     stacks = []
     stack_dirs = []
     for n in (1, 2):
-        (src / f"IMG_000{n}.CR3").write_bytes(f"frame-{n}".encode())
+        (src / f"IMG_000{n}a.CR3").write_bytes(f"frame-{n}a".encode())
+        (src / f"IMG_000{n}b.CR3").write_bytes(f"frame-{n}b".encode())
         (src / f"IMG_000{n}.JPG").write_bytes(f"composite-{n}".encode())
         stack_dir = tmp_path / "dst" / "2026-01-01" / f"IMG_000{n}"
         stack_dirs.append(stack_dir)
@@ -692,7 +707,10 @@ def _two_stack_plan(tmp_path):
                 dest_dir=str(stack_dir),
                 jpg_src=str(src / f"IMG_000{n}.JPG"),
                 jpg_dest=str(stack_dir / f"IMG_000{n}.JPG"),
-                frame_sources=(str(src / f"IMG_000{n}.CR3"),),
+                frame_sources=(
+                    str(src / f"IMG_000{n}a.CR3"),
+                    str(src / f"IMG_000{n}b.CR3"),
+                ),
             )
         )
     plan = stackcopy.CanonImportPlan(
@@ -885,7 +903,9 @@ def test_render_helicon_uses_raw_frames_when_no_dng(tmp_path, monkeypatch):
     exit_code = stackcopy.run_canon_import(args)
 
     assert exit_code == 0
-    assert captured["frames"] == [str(stack_dir / "IMG_0001.CR3")]
+    assert captured["frames"] == [
+        str(stack_dir / "IMG_0001.CR3"), str(stack_dir / "IMG_0002.CR3"),
+    ]
 
 
 def test_render_helicon_uses_dng_frames_in_capture_order(tmp_path, monkeypatch):
@@ -1313,6 +1333,40 @@ class CanonPlanJsonStdoutRoutingTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "canon-import")
         self.assertEqual(payload["stacks"], 0)
         self.assertEqual(payload["others"], 1)
+
+
+class HeliconTuningFlagsTests(unittest.TestCase):
+    def test_radius_and_smoothing_are_accepted(self):
+        parser = stackcopy.build_parser()
+        args = parser.parse_args(
+            ["--canon-import", "s", "d",
+             "--render-helicon", "--helicon-radius", "6", "--helicon-smoothing", "7"]
+        )
+        self.assertEqual(args.helicon_radius, 6)
+        self.assertEqual(args.helicon_smoothing, 7)
+
+    def test_they_default_to_the_helicon_modules_values(self):
+        parser = stackcopy.build_parser()
+        args = parser.parse_args(["--canon-import", "s", "d"])
+        self.assertEqual(args.helicon_radius, helicon_focus.DEFAULT_RADIUS)
+        self.assertEqual(args.helicon_smoothing, helicon_focus.DEFAULT_SMOOTHING)
+
+    def test_they_are_canon_only(self):
+        parser = stackcopy.build_parser()
+        with self.assertRaises(SystemExit):
+            stackcopy.parse_arguments(
+                ["--rename", "somedir", "--helicon-radius", "6"], parser=parser
+            )
+
+
+class SingleFrameRenderSkipTests(unittest.TestCase):
+    def test_a_one_frame_stack_is_skipped_not_failed(self):
+        self.assertTrue(stackcopy.canon_stack_is_renderable.__doc__)
+        self.assertFalse(stackcopy.canon_stack_is_renderable(["only.dng"]))
+        self.assertTrue(stackcopy.canon_stack_is_renderable(["a.dng", "b.dng"]))
+
+    def test_an_empty_stack_is_not_renderable(self):
+        self.assertFalse(stackcopy.canon_stack_is_renderable([]))
 
 
 if __name__ == "__main__":

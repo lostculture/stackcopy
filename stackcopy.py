@@ -3281,6 +3281,16 @@ def _canon_frame_dest(
     return os.path.join(stack.dest_dir, name)
 
 
+def canon_stack_is_renderable(frames) -> bool:
+    """Whether Helicon has anything to stack.
+
+    A one-frame stack is a legitimate import - the frame and the camera's own
+    composite are both worth keeping - but an impossible render, and Helicon
+    exits non-zero when asked.  Skipping it is not a failure.
+    """
+    return len(frames) >= 2
+
+
 def run_canon_import(args, plan_json_stdout=None) -> int:
     """Execute --canon-import: scan, plan, preflight, copy, convert, report.
 
@@ -3562,13 +3572,22 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
                     "partial stack would produce a silently wrong image"
                 )
                 continue
+            if not canon_stack_is_renderable(frames):
+                print(
+                    f"  Skipped Helicon for {display_path(stack.dest_dir)}: "
+                    f"{len(frames)} frame(s), nothing to stack."
+                )
+                continue
             output = os.path.join(
                 os.path.dirname(stack.dest_dir),
                 f"{os.path.basename(stack.dest_dir)} helicon.jpg",
             )
             try:
                 result = helicon_focus.render_stack(
-                    helicon, frames, output, method=args.helicon_method
+                    helicon, frames, output,
+                    method=args.helicon_method,
+                    radius=args.helicon_radius,
+                    smoothing=args.helicon_smoothing,
                 )
             except Exception as error:
                 render_failures += 1
@@ -3839,6 +3858,26 @@ def build_parser() -> argparse.ArgumentParser:
             f"(default: {helicon_focus.DEFAULT_METHOD})."
         ),
     )
+    parser.add_argument(
+        "--helicon-radius",
+        type=int,
+        default=helicon_focus.DEFAULT_RADIUS,
+        metavar="N",
+        help=(
+            "Helicon Focus radius "
+            f"(default: {helicon_focus.DEFAULT_RADIUS})."
+        ),
+    )
+    parser.add_argument(
+        "--helicon-smoothing",
+        type=int,
+        default=helicon_focus.DEFAULT_SMOOTHING,
+        metavar="N",
+        help=(
+            "Helicon Focus smoothing "
+            f"(default: {helicon_focus.DEFAULT_SMOOTHING})."
+        ),
+    )
 
     return parser
 
@@ -3856,7 +3895,16 @@ def parse_arguments(
     """
     if parser is None:
         parser = build_parser()
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if (
+        args.helicon_radius != helicon_focus.DEFAULT_RADIUS
+        or args.helicon_smoothing != helicon_focus.DEFAULT_SMOOTHING
+    ) and not args.canon_import:
+        parser.error(
+            "--helicon-radius and --helicon-smoothing can only be used "
+            "with --canon-import."
+        )
+    return args
 
 
 def validate_plan_json_mode(parser, args) -> None:
