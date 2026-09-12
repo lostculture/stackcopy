@@ -1626,7 +1626,30 @@ class StackcopyGUI(ctk.CTk):
         self.advanced_btn.configure(
             text=advanced_button_label(self._advanced_open)
         )
+        if self._advanced_open:
+            self._reveal_advanced()
         self._save_current_defaults()
+
+    def _reveal_advanced(self) -> None:
+        """Scroll the options into view once the section opens.
+
+        The body scrolls, and on a window near its minimum height the options
+        appear below the fold, so expanding the section looks like it did
+        nothing at all.  The layout has to settle before the scroll region
+        knows the new height, hence the idle callback.
+        """
+        self.after_idle(self._scroll_body_to_bottom)
+
+    def _scroll_body_to_bottom(self) -> None:
+        canvas = getattr(self.body, "_parent_canvas", None)
+        if canvas is None:
+            return
+        try:
+            self.update_idletasks()
+            canvas.yview_moveto(1.0)
+        except Exception:
+            # Scrolling is a courtesy; never let it break the toggle itself.
+            pass
 
     def _toggle_log(self) -> None:
         self._log_open = not self._log_open
