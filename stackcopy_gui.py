@@ -183,6 +183,93 @@ def parse_plan_json(text: str) -> dict[str, object] | None:
     return normalized
 
 
+CANON_MODE = "canon-import"
+LIGHTROOM_MODE = "lightroomimport"
+
+
+def plan_mode(plan: dict[str, object] | None) -> str:
+    """Which import a plan describes.
+
+    A CLI older than Canon support sends no ``mode`` at all, and the only
+    import it could have been describing is the Lightroom one.
+    """
+    if not plan:
+        return LIGHTROOM_MODE
+    return CANON_MODE if plan.get("mode") == CANON_MODE else LIGHTROOM_MODE
+
+
+def plan_row_labels(plan: dict[str, object] | None) -> tuple[str, str, str]:
+    """The three plan rows, worded for the import being described.
+
+    The rows themselves are the same three ideas in both modes - the finished
+    photos, the frames behind them, and everything left over - so only the
+    nouns change.
+
+    The Olympus/Lightroom branch reproduces the wording the widget builds
+    inline today (see ``_refresh_idle_plan``) character for character,
+    example substitution included, so moving that logic here later changes
+    nothing an Olympus user sees.
+    """
+    outputs = plan.get("stacked_outputs") if plan else None
+    inputs = plan.get("stack_inputs") if plan else None
+    others = plan.get("others") if plan else None
+    if plan_mode(plan) == CANON_MODE:
+        return (
+            f"{outputs} stacked photos from the camera - kept beside their frames",
+            f"{inputs} frames converted to DNG - one folder per stack, ready "
+            "for Helicon Focus",
+            f"{others} loose CR3 files - copied unchanged, they belong to no stack",
+        )
+    example = (
+        str(plan.get("stacked_output_example", "a name like P8081885 stacked.jpg"))
+        if plan
+        else ""
+    )
+    generic_output = "Finished stacked photos - renamed with 'stacked' added"
+    generic_output += " to the name"
+    stacked = (
+        f"{outputs} finished stacked photos - renamed {example}"
+        if outputs is not None
+        else generic_output
+    )
+    frames = (
+        f"{inputs} frames that fed those stacks - kept in case you want "
+        "to stack the RAWs yourself"
+        if inputs is not None
+        else (
+            "Frames that fed those stacks - kept in case you want to "
+            "stack the RAWs yourself"
+        )
+    )
+    other = (
+        f"{others} single shots and videos - names untouched, dated "
+        "folders "
+        "as Lightroom would make them"
+        if others is not None
+        else (
+            "Single shots and videos - names untouched, dated folders as "
+            "Lightroom would make them"
+        )
+    )
+    return stacked, frames, other
+
+
+def detect_canon_mode(plan: dict[str, object] | None) -> tuple[bool, str]:
+    """Whether the card looks like Canon, and the reason to show the user.
+
+    The rule is deliberately just "are there CR3s".  A card holding both CR3
+    and ORF is not a real case, and inventing a signal to arbitrate one would
+    be speculative.
+    """
+    if not plan:
+        return False, ""
+    count = plan.get("canon_frames_detected")
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        return False, ""
+    noun = "file" if count == 1 else "files"
+    return True, f"found {count} CR3 {noun}"
+
+
 def exiftool_status_display(
     plan: dict[str, object] | None,
 ) -> tuple[str, str, bool] | None:

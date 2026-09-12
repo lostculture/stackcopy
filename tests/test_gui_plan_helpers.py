@@ -464,3 +464,104 @@ class AdvancedButtonLabelTests(unittest.TestCase):
             gui.advanced_button_label(True), gui.advanced_button_label(False)
         )
 
+
+CANON_PLAN = {
+    "mode": "canon-import", "stacks": 71, "stacked_outputs": 71,
+    "stack_inputs": 1718, "others": 1, "total": 1790,
+    "canon_frames_detected": 1719, "unresolved": 0,
+}
+OLYMPUS_PLAN = {
+    "stacks": 3, "stacked_outputs": 3, "stack_inputs": 30,
+    "others": 9, "total": 42,
+}
+
+
+class PlanModeTests(unittest.TestCase):
+    def test_canon_plan_reports_canon(self):
+        self.assertEqual(gui.plan_mode(CANON_PLAN), "canon-import")
+
+    def test_a_plan_without_a_mode_field_is_lightroomimport(self):
+        """An older CLI sends no mode; it can only have been lightroomimport."""
+        self.assertEqual(gui.plan_mode(OLYMPUS_PLAN), "lightroomimport")
+
+    def test_no_plan_is_lightroomimport(self):
+        self.assertEqual(gui.plan_mode(None), "lightroomimport")
+
+
+class PlanRowLabelTests(unittest.TestCase):
+    def test_canon_rows_name_canon_things(self):
+        stacked, frames, other = gui.plan_row_labels(CANON_PLAN)
+        self.assertIn("71", stacked)
+        self.assertIn("1718", frames)
+        self.assertIn("DNG", frames)
+        self.assertIn("1", other)
+        self.assertIn("CR3", other)
+
+    def test_olympus_rows_are_unchanged(self):
+        stacked, frames, other = gui.plan_row_labels(OLYMPUS_PLAN)
+        self.assertIn("3 finished stacked photos", stacked)
+        self.assertIn("frames that fed those stacks", frames)
+        self.assertIn("single shots and videos", other)
+
+    def test_the_two_modes_do_not_share_wording(self):
+        """A Canon card must not be described as single shots and videos."""
+        canon = gui.plan_row_labels(CANON_PLAN)
+        olympus = gui.plan_row_labels(OLYMPUS_PLAN)
+        self.assertNotEqual(canon[1], olympus[1])
+        self.assertNotIn("videos", canon[2])
+
+    def test_olympus_first_row_substitutes_the_real_example_name(self):
+        """Pins stackcopy_gui.py:1526-1539's example-substitution behaviour.
+
+        Today's widget code reads ``stacked_output_example`` from the plan
+        and splices it into the first row rather than naming the output
+        count's own noun twice. A helper that used ``outputs`` in place of
+        the example would still pass every other assertion here while
+        silently changing what an Olympus user sees.
+        """
+        plan = dict(OLYMPUS_PLAN)
+        plan["stacked_output_example"] = "P8081985 stacked.jpg"
+        stacked, _frames, _other = gui.plan_row_labels(plan)
+        self.assertIn("P8081985 stacked.jpg", stacked)
+        self.assertIn("3 finished stacked photos", stacked)
+
+    def test_olympus_first_row_falls_back_to_the_generic_example(self):
+        """Without an explicit example, today's widget shows a stock one."""
+        stacked, _frames, _other = gui.plan_row_labels(OLYMPUS_PLAN)
+        self.assertIn("a name like P8081885 stacked.jpg", stacked)
+
+    def test_no_plan_uses_the_fully_generic_olympus_wording(self):
+        """With no plan at all, today's widget shows the count-free strings."""
+        stacked, frames, other = gui.plan_row_labels(None)
+        self.assertEqual(
+            stacked,
+            "Finished stacked photos - renamed with 'stacked' added to the name",
+        )
+        self.assertEqual(
+            frames,
+            "Frames that fed those stacks - kept in case you want to "
+            "stack the RAWs yourself",
+        )
+        self.assertEqual(
+            other,
+            "Single shots and videos - names untouched, dated folders as "
+            "Lightroom would make them",
+        )
+
+
+class DetectCanonModeTests(unittest.TestCase):
+    def test_cr3_files_tick_the_box_and_say_why(self):
+        ticked, reason = gui.detect_canon_mode(CANON_PLAN)
+        self.assertTrue(ticked)
+        self.assertIn("1719", reason)
+        self.assertIn("CR3", reason)
+
+    def test_a_card_without_cr3_does_not_tick(self):
+        ticked, reason = gui.detect_canon_mode(OLYMPUS_PLAN)
+        self.assertFalse(ticked)
+        self.assertEqual(reason, "")
+
+    def test_zero_cr3_reported_explicitly_does_not_tick(self):
+        ticked, _ = gui.detect_canon_mode({"canon_frames_detected": 0})
+        self.assertFalse(ticked)
+
