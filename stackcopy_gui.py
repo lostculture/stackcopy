@@ -838,6 +838,26 @@ class StackcopyGUI(ctk.CTk):
             value=state_flag(saved, "detect_stacks", True)
         )
         self.debug_stacks_var = ctk.BooleanVar(value=state_flag(saved, "debug_stacks"))
+        self.canon_mode_var = ctk.BooleanVar(value=state_flag(saved, "canon_mode"))
+        self.canon_reason_var = ctk.StringVar(value="")
+        self.canon_dng_var = ctk.BooleanVar(
+            value=state_flag(saved, "canon_dng", True)
+        )
+        self.canon_dng_jobs_var = ctk.StringVar(
+            value=state_text(saved, "canon_dng_jobs", str(CANON_DEFAULT_DNG_JOBS))
+        )
+        self.canon_render_var = ctk.BooleanVar(
+            value=state_flag(saved, "canon_render")
+        )
+        self.canon_method_var = ctk.StringVar(
+            value=state_text(saved, "canon_method", str(CANON_DEFAULT_METHOD))
+        )
+        self.canon_radius_var = ctk.StringVar(
+            value=state_text(saved, "canon_radius", str(CANON_DEFAULT_RADIUS))
+        )
+        self.canon_smoothing_var = ctk.StringVar(
+            value=state_text(saved, "canon_smoothing", str(CANON_DEFAULT_SMOOTHING))
+        )
         self._advanced_open = state_flag(saved, "advanced_open")
         self._log_open = False
 
@@ -847,6 +867,7 @@ class StackcopyGUI(ctk.CTk):
         self._build_header()
         self._build_source_strip()
         self._build_mode_section()
+        self._build_canon_section()
         self._build_plan_section()
         self._build_actions()
         self._build_activity()
@@ -1066,6 +1087,34 @@ class StackcopyGUI(ctk.CTk):
         ).grid(row=2, column=0, sticky="ew", pady=(4, 0))
         self._sync_mode_help()
 
+    def _build_canon_section(self) -> None:
+        self.canon_frame = ctk.CTkFrame(self.body, fg_color="transparent")
+        self.canon_frame.grid(row=3, column=0, sticky="ew", padx=22, pady=(0, 4))
+        self.canon_check = ctk.CTkCheckBox(
+            self.canon_frame,
+            text="Canon card (CR3 to DNG)",
+            variable=self.canon_mode_var,
+            command=self._on_canon_mode_changed,
+        )
+        self.canon_check.grid(row=0, column=0, sticky="w")
+        self.canon_reason = ctk.CTkLabel(
+            self.canon_frame, textvariable=self.canon_reason_var
+        )
+        self.canon_reason.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self.canon_dng_check = ctk.CTkCheckBox(
+            self.canon_frame,
+            text="Convert CR3 to DNG",
+            variable=self.canon_dng_var,
+            command=self._save_current_defaults,
+        )
+        self.canon_dng_check.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.canon_jobs_entry = ctk.CTkEntry(
+            self.canon_frame, textvariable=self.canon_dng_jobs_var, width=50
+        )
+        self.canon_jobs_entry.grid(row=1, column=1, sticky="w", padx=(10, 0),
+                                   pady=(8, 0))
+        self.canon_frame.grid_remove()
+
     def _build_plan_section(self) -> None:
         self.plan_heading_var = ctk.StringVar(value="Where these files will land")
         ctk.CTkLabel(
@@ -1073,9 +1122,9 @@ class StackcopyGUI(ctk.CTk):
             textvariable=self.plan_heading_var,
             anchor="w",
             font=ctk.CTkFont(size=18, weight="bold"),
-        ).grid(row=3, column=0, sticky="ew", padx=22, pady=(0, 5))
+        ).grid(row=4, column=0, sticky="ew", padx=22, pady=(0, 5))
         self.plan_rows = ctk.CTkFrame(self.body, corner_radius=10)
-        self.plan_rows.grid(row=4, column=0, sticky="ew", padx=22)
+        self.plan_rows.grid(row=5, column=0, sticky="ew", padx=22)
         self.plan_rows.grid_columnconfigure(1, weight=1)
         self.plan_headline_vars: dict[str, ctk.StringVar] = {}
         self.plan_path_vars: dict[str, ctk.StringVar] = {}
@@ -1151,7 +1200,7 @@ class StackcopyGUI(ctk.CTk):
 
     def _build_actions(self) -> None:
         self.actions = ctk.CTkFrame(self.body, fg_color="transparent")
-        self.actions.grid(row=5, column=0, sticky="ew", padx=22, pady=(15, 18))
+        self.actions.grid(row=6, column=0, sticky="ew", padx=22, pady=(15, 18))
         self.actions.grid_columnconfigure(2, weight=1)
         self.start_btn = ctk.CTkButton(
             self.actions, height=40, width=175, command=lambda: self._start(False)
@@ -1198,12 +1247,38 @@ class StackcopyGUI(ctk.CTk):
             command=self._save_current_defaults,
         )
         self.debug_check.grid(row=0, column=2, sticky="w", padx=(22, 0))
+        self.helicon_check = ctk.CTkCheckBox(
+            self.advanced_frame,
+            text="Render with Helicon Focus",
+            variable=self.canon_render_var,
+            command=self._on_helicon_toggle,
+        )
+        self.helicon_check.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.helicon_method = ctk.CTkSegmentedButton(
+            self.advanced_frame,
+            values=["A", "B", "C"],
+            command=self._on_helicon_method_changed,
+        )
+        self.helicon_method.set(["A", "B", "C"][int(self.canon_method_var.get())])
+        self.helicon_method.grid(row=1, column=1, sticky="w", padx=(22, 0),
+                                 pady=(10, 0))
+        self.helicon_radius = ctk.CTkEntry(
+            self.advanced_frame, textvariable=self.canon_radius_var, width=50
+        )
+        self.helicon_radius.grid(row=1, column=2, sticky="w", padx=(22, 0),
+                                 pady=(10, 0))
+        self.helicon_smoothing = ctk.CTkEntry(
+            self.advanced_frame, textvariable=self.canon_smoothing_var, width=50
+        )
+        self.helicon_smoothing.grid(row=1, column=3, sticky="w", padx=(10, 0),
+                                    pady=(10, 0))
         if not self._advanced_open:
             self.advanced_frame.grid_remove()
+        self._on_helicon_toggle()
 
     def _build_activity(self) -> None:
         self.activity = ctk.CTkFrame(self.body, corner_radius=10)
-        self.activity.grid(row=6, column=0, sticky="ew", padx=22, pady=(0, 20))
+        self.activity.grid(row=7, column=0, sticky="ew", padx=22, pady=(0, 20))
         self.activity.grid_columnconfigure(0, weight=1)
         self.activity.grid_remove()
         top = ctk.CTkFrame(self.activity, fg_color="transparent")
@@ -1483,6 +1558,35 @@ class StackcopyGUI(ctk.CTk):
         self._refresh_idle_plan()
         self._schedule_plan_scan()
 
+    def _on_canon_mode_changed(self) -> None:
+        self._save_current_defaults()
+        self._refresh_idle_plan()
+        self._schedule_plan_scan()
+
+    def _on_helicon_toggle(self) -> None:
+        state = "normal" if self.canon_render_var.get() else "disabled"
+        for widget in (
+            self.helicon_method, self.helicon_radius, self.helicon_smoothing
+        ):
+            widget.configure(state=state)
+        self._save_current_defaults()
+
+    def _on_helicon_method_changed(self, value: str) -> None:
+        self.canon_method_var.set(str(["A", "B", "C"].index(value)))
+        self._save_current_defaults()
+
+    def _apply_canon_detection(self) -> None:
+        """Show the Canon block when the scan found CR3 files, and say why."""
+        detected, reason = detect_canon_mode(self._plan)
+        self.canon_reason_var.set(reason)
+        if detected or self.canon_mode_var.get():
+            self.canon_frame.grid()
+        else:
+            self.canon_frame.grid_remove()
+        if detected and not self.canon_mode_var.get():
+            self.canon_mode_var.set(True)
+            self._save_current_defaults()
+
     def _sync_mode_help(self) -> None:
         if self.mode_var.get() == COPY_MODE:
             text = "Every file stays on the card after a safe copy is written."
@@ -1511,6 +1615,13 @@ class StackcopyGUI(ctk.CTk):
                 "detect_stacks": bool(self.detect_stacks_var.get()),
                 "debug_stacks": bool(self.debug_stacks_var.get()),
                 "advanced_open": bool(self._advanced_open),
+                "canon_mode": bool(self.canon_mode_var.get()),
+                "canon_dng": bool(self.canon_dng_var.get()),
+                "canon_dng_jobs": self.canon_dng_jobs_var.get(),
+                "canon_render": bool(self.canon_render_var.get()),
+                "canon_method": self.canon_method_var.get(),
+                "canon_radius": self.canon_radius_var.get(),
+                "canon_smoothing": self.canon_smoothing_var.get(),
             }
         )
         save_gui_state(self._state)
@@ -1710,6 +1821,7 @@ class StackcopyGUI(ctk.CTk):
                 plan, leave_on_card=self.mode_var.get() == COPY_MODE
             )
         )
+        self._apply_canon_detection()
 
     def _apply_plan(self, payload: dict[str, object] | None) -> None:
         self._plan = payload

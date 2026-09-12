@@ -175,6 +175,13 @@ class StatePreservationTests(unittest.TestCase):
             verbose_var=SimpleNamespace(get=lambda: True),
             detect_stacks_var=SimpleNamespace(get=lambda: True),
             debug_stacks_var=SimpleNamespace(get=lambda: False),
+            canon_mode_var=SimpleNamespace(get=lambda: False),
+            canon_dng_var=SimpleNamespace(get=lambda: True),
+            canon_dng_jobs_var=SimpleNamespace(get=lambda: "1"),
+            canon_render_var=SimpleNamespace(get=lambda: False),
+            canon_method_var=SimpleNamespace(get=lambda: "2"),
+            canon_radius_var=SimpleNamespace(get=lambda: "8"),
+            canon_smoothing_var=SimpleNamespace(get=lambda: "4"),
         )
 
     def save(self, state):
@@ -215,6 +222,16 @@ class StatePreservationTests(unittest.TestCase):
         self.assertIs(written["verbose"], True)
         self.assertIs(written["debug_stacks"], False)
         self.assertIs(written["advanced_open"], True)
+
+    def test_canon_settings_are_persisted_alongside_the_rest(self):
+        written, _ = self.save({})
+        self.assertIs(written["canon_mode"], False)
+        self.assertIs(written["canon_dng"], True)
+        self.assertEqual(written["canon_dng_jobs"], "1")
+        self.assertIs(written["canon_render"], False)
+        self.assertEqual(written["canon_method"], "2")
+        self.assertEqual(written["canon_radius"], "8")
+        self.assertEqual(written["canon_smoothing"], "4")
 
     def test_an_unknown_key_from_a_future_build_is_preserved(self):
         written, _ = self.save({"something_new": "keep me"})
@@ -742,3 +759,202 @@ class HeaderConstructionTests(unittest.TestCase):
         self.assertTrue(target.update_dismiss_btn.gridded)
         self.assertIn("Stackcopy 1.6.0 is available", target.update_var.get())
         self.assertIn("1.5.9", target.update_var.get())
+
+
+class CanonStateRoundTripTests(unittest.TestCase):
+    def test_every_canon_setting_round_trips(self):
+        state = {
+            "canon_mode": True, "canon_dng": False, "canon_dng_jobs": 8,
+            "canon_render": True, "canon_method": 1,
+            "canon_radius": 6, "canon_smoothing": 7,
+        }
+        self.assertTrue(gui.state_flag(state, "canon_mode"))
+        self.assertFalse(gui.state_flag(state, "canon_dng", True))
+        self.assertTrue(gui.state_flag(state, "canon_render"))
+        self.assertEqual(gui.state_text(state, "canon_dng_jobs"), "8")
+        self.assertEqual(gui.state_text(state, "canon_method"), "1")
+        self.assertEqual(gui.state_text(state, "canon_radius"), "6")
+        self.assertEqual(gui.state_text(state, "canon_smoothing"), "7")
+
+    def test_absent_canon_settings_fall_back_to_the_cli_defaults(self):
+        self.assertEqual(
+            gui.state_text({}, "canon_dng_jobs", str(gui.CANON_DEFAULT_DNG_JOBS)),
+            str(gui.CANON_DEFAULT_DNG_JOBS),
+        )
+        self.assertFalse(gui.state_flag({}, "canon_mode"))
+        self.assertTrue(gui.state_flag({}, "canon_dng", True))
+
+
+class CanonSectionConstructionTests(unittest.TestCase):
+    """Build the Canon block against a recording stand-in for customtkinter.
+
+    Proves the block is gridded at construction time and then hidden again
+    before the window is ever shown, since it has no meaning until a scan
+    finds CR3 files.
+    """
+
+    def fake_ctk(self, log):
+        class Widget:
+            def __init__(self, parent=None, **kwargs):
+                self.parent = parent
+                self.kwargs = kwargs
+                self.gridded = False
+                log.append(("create", type(self).__name__, kwargs.get("text")))
+
+            def grid(self, **kwargs):
+                self.gridded = True
+                log.append(("grid", type(self).__name__, kwargs))
+
+            def grid_remove(self):
+                self.gridded = False
+                log.append(("grid_remove", type(self).__name__, None))
+
+        names = ("CTkFrame", "CTkCheckBox", "CTkLabel", "CTkEntry")
+        return SimpleNamespace(
+            **{name: type(name, (Widget,), {}) for name in names}
+        )
+
+    def build_canon_section(self):
+        log = []
+        fake = self.fake_ctk(log)
+        target = SimpleNamespace(
+            body=object(),
+            canon_mode_var=SimpleNamespace(get=lambda: False),
+            canon_reason_var=SimpleNamespace(get=lambda: ""),
+            canon_dng_var=SimpleNamespace(get=lambda: True),
+            canon_dng_jobs_var=SimpleNamespace(get=lambda: "1"),
+            _on_canon_mode_changed=lambda: None,
+            _save_current_defaults=lambda: None,
+        )
+        with mock.patch.object(gui, "ctk", fake):
+            gui.StackcopyGUI._build_canon_section(target)
+        return target, log
+
+    def test_the_canon_block_is_built_but_hidden_by_default(self):
+        target, _ = self.build_canon_section()
+        self.assertFalse(target.canon_frame.gridded)
+        self.assertTrue(hasattr(target, "canon_check"))
+        self.assertTrue(hasattr(target, "canon_dng_check"))
+        self.assertTrue(hasattr(target, "canon_jobs_entry"))
+
+
+class CanonDetectionTests(unittest.TestCase):
+    """``_apply_canon_detection`` shows/hides the block and states why."""
+
+    def make_target(self, plan, mode_initial=False):
+        state = {"gridded": True}
+
+        class Frame:
+            def grid(self):
+                state["gridded"] = True
+
+            def grid_remove(self):
+                state["gridded"] = False
+
+        reason = {}
+        saved = {"calls": 0}
+        target = SimpleNamespace(
+            _plan=plan,
+            canon_frame=Frame(),
+            canon_reason_var=SimpleNamespace(
+                set=lambda v: reason.__setitem__("value", v)
+            ),
+            canon_mode_var=SimpleNamespace(get=lambda: mode_initial, set=lambda v: None),
+            _save_current_defaults=lambda: saved.__setitem__(
+                "calls", saved["calls"] + 1
+            ),
+        )
+        return target, state, reason, saved
+
+    def test_a_canon_card_reveals_the_block_and_reports_why(self):
+        plan = {"canon_frames_detected": 3}
+        target, state, reason, _ = self.make_target(plan)
+        gui.StackcopyGUI._apply_canon_detection(target)
+        self.assertTrue(state["gridded"])
+        self.assertEqual(reason["value"], "found 3 CR3 files")
+
+    def test_a_non_canon_card_keeps_the_block_hidden(self):
+        target, state, reason, _ = self.make_target(None)
+        gui.StackcopyGUI._apply_canon_detection(target)
+        self.assertFalse(state["gridded"])
+        self.assertEqual(reason["value"], "")
+
+    def test_detection_turns_the_checkbox_on_and_saves(self):
+        plan = {"canon_frames_detected": 1}
+        target, _state, _reason, saved = self.make_target(plan)
+        set_calls = []
+        target.canon_mode_var.set = lambda v: set_calls.append(v)
+        gui.StackcopyGUI._apply_canon_detection(target)
+        self.assertEqual(set_calls, [True])
+        self.assertEqual(saved["calls"], 1)
+
+    def test_a_manually_checked_box_keeps_the_block_visible_without_cr3s(self):
+        target, state, _reason, _saved = self.make_target(None, mode_initial=True)
+        gui.StackcopyGUI._apply_canon_detection(target)
+        self.assertTrue(state["gridded"])
+
+
+class HeliconToggleTests(unittest.TestCase):
+    """``_on_helicon_toggle`` enables/disables the sub-controls, never hides them."""
+
+    def make_target(self, render_on):
+        class Widget:
+            def __init__(self):
+                self.state = None
+
+            def configure(self, **kwargs):
+                self.state = kwargs.get("state")
+
+        saved = {"calls": 0}
+        target = SimpleNamespace(
+            canon_render_var=SimpleNamespace(get=lambda: render_on),
+            helicon_method=Widget(),
+            helicon_radius=Widget(),
+            helicon_smoothing=Widget(),
+            _save_current_defaults=lambda: saved.__setitem__(
+                "calls", saved["calls"] + 1
+            ),
+        )
+        return target, saved
+
+    def test_rendering_off_disables_the_helicon_sub_controls(self):
+        target, saved = self.make_target(False)
+        gui.StackcopyGUI._on_helicon_toggle(target)
+        self.assertEqual(target.helicon_method.state, "disabled")
+        self.assertEqual(target.helicon_radius.state, "disabled")
+        self.assertEqual(target.helicon_smoothing.state, "disabled")
+        self.assertEqual(saved["calls"], 1)
+
+    def test_rendering_on_enables_the_helicon_sub_controls(self):
+        target, _saved = self.make_target(True)
+        gui.StackcopyGUI._on_helicon_toggle(target)
+        self.assertEqual(target.helicon_method.state, "normal")
+        self.assertEqual(target.helicon_radius.state, "normal")
+        self.assertEqual(target.helicon_smoothing.state, "normal")
+
+
+class HeliconMethodChangeTests(unittest.TestCase):
+    def test_choosing_a_letter_stores_its_index_and_saves(self):
+        set_calls = []
+        saved = {"calls": 0}
+        target = SimpleNamespace(
+            canon_method_var=SimpleNamespace(set=lambda v: set_calls.append(v)),
+            _save_current_defaults=lambda: saved.__setitem__(
+                "calls", saved["calls"] + 1
+            ),
+        )
+        gui.StackcopyGUI._on_helicon_method_changed(target, "C")
+        self.assertEqual(set_calls, ["2"])
+        self.assertEqual(saved["calls"], 1)
+
+
+class CanonModeChangeTests(unittest.TestCase):
+    def test_toggling_the_canon_checkbox_saves_refreshes_and_rescans(self):
+        calls = []
+        target = SimpleNamespace(
+            _save_current_defaults=lambda: calls.append("save"),
+            _refresh_idle_plan=lambda: calls.append("refresh"),
+            _schedule_plan_scan=lambda: calls.append("scan"),
+        )
+        gui.StackcopyGUI._on_canon_mode_changed(target)
+        self.assertEqual(calls, ["save", "refresh", "scan"])
