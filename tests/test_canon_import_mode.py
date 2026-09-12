@@ -1,11 +1,17 @@
 import json
 import os
+import subprocess
+import sys
+import tempfile
+import unittest
 from pathlib import Path
 
 import pytest
 
 import canon_stacks
 import stackcopy
+
+ROOT = Path(__file__).resolve().parents[1]
 
 FIXTURE = Path(__file__).parent / "fixtures" / "canon_108eosr6.json"
 
@@ -1136,3 +1142,39 @@ def test_unresolved_composite_reports_all_of_its_notes(tmp_path, monkeypatch, ca
     output = capsys.readouterr().out
     assert "first reason" in output
     assert "second reason" in output
+
+
+class Cr3CountsAsRawTests(unittest.TestCase):
+    """.cr3 must be recognised as RAW by the shared, non-Canon code paths.
+
+    Canon's previous raw format .cr2 was already listed; .cr3 was missing, so
+    every CR3 on a card fell through to "other data" and a Canon card reported
+    a fraction of its real file count.  The rule that matters to a user is the
+    one --copy applies: a JPG *with* a matching raw is an ordinary shot and is
+    left alone, while a JPG *without* one is an in-camera output worth copying.
+    """
+
+    def test_a_jpg_beside_a_cr3_is_not_treated_as_an_unpaired_output(self):
+        with tempfile.TemporaryDirectory() as work:
+            source = Path(work) / "card"
+            dest = Path(work) / "out"
+            source.mkdir()
+            # IMG_0001 is an ordinary raw+JPG pair; IMG_0002 has no raw.
+            for name in ("IMG_0001.CR3", "IMG_0001.JPG", "IMG_0002.JPG"):
+                (source / name).write_bytes(b"x" * 32)
+
+            completed = subprocess.run(
+                [sys.executable, str(ROOT / "stackcopy.py"),
+                 "--copy", str(source), str(dest)],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            copied = sorted(p.name for p in dest.rglob("*") if p.is_file())
+            # Without .cr3 in RAW_EXTENSIONS, IMG_0001.JPG looks unpaired too
+            # and both JPGs are copied.
+            self.assertEqual(copied, ["IMG_0002.JPG"])
+
+
+if __name__ == "__main__":
+    unittest.main()

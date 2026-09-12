@@ -4082,6 +4082,7 @@ def main():
     RAW_EXTENSIONS = {
         ".orf",
         ".cr2",
+        ".cr3",
         ".nef",
         ".arw",
         ".dng",
