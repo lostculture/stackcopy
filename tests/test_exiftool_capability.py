@@ -719,13 +719,13 @@ class GuiStatusHelperTests(unittest.TestCase):
 
 
 class VersionVisibilityTests(unittest.TestCase):
-    def test_the_version_is_still_1_7_0(self):
+    def test_the_version_is_still_1_8_0(self):
         # Deliberately version-specific: this is a tripwire, not a live
         # check. It exists to fail the moment someone bumps
         # STACKCOPY_VERSION, so the bump forces a conscious update of this
         # literal alongside the tag and the ChangeLog.md entry - not to be
         # made dynamic.
-        self.assertEqual(stackcopy.STACKCOPY_VERSION, "1.7.0")
+        self.assertEqual(stackcopy.STACKCOPY_VERSION, "1.8.0")
 
     def test_the_gui_does_not_hard_code_its_own_copy(self):
         self.assertEqual(gui.STACKCOPY_VERSION, stackcopy.STACKCOPY_VERSION)

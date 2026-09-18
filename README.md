@@ -135,9 +135,10 @@ the first second with an actionable message - identifying the likely cause
 and where to get a newer converter - instead of failing partway through a
 65 GB import several hours in.
 
-This detection and conversion path has so far been exercised against a
-single camera body, the Canon EOS R6 Mark II, and a single test card.
-Detection itself relies only on the `FocusBracketingDepthComposite` and
+This detection and conversion path, including the GUI controls described
+below, has so far been exercised against a single camera body, the Canon EOS
+R6 Mark II, on two test cards. Detection itself relies only on the
+`FocusBracketingDepthComposite` and
 `FocusBracketingImageCount` MakerNotes and Canon's standard `IMG_####.CR3`
 file numbering, so any body that writes those the same way is reading the
 same signals this code already handles - but which specific other bodies do
@@ -171,8 +172,9 @@ clutter the library.
    are remembered in `gui-state.json` as before.
 5. **Import or preview** - the main button includes the planned file count.
    **Preview without moving anything** runs the same plan as a dry run. The
-   collapsed **Advanced** section contains Verbose log, Detect stacks, and Show
-   stack debug output.
+   collapsed **Advanced** section contains Verbose log, Detect stacks, Show
+   stack debug output, and, for rendering a Canon stack, Helicon Focus's
+   method/radius/smoothing.
 6. **Follow the import** - the running view names the phase and current file's
    role, estimates time remaining, and counts stacked photos, stack frames,
    singles/video, and problems separately. **Stop after this file** is safe:
@@ -185,6 +187,30 @@ clutter the library.
 
 Files land in exactly the same place as the `--lightroomimport` command. See
 [Where files go](#where-files-go).
+
+### Canon cards in the GUI
+
+A card holding CR3 files is noticed during the same background scan as
+everything else - there is no separate step to run first. When that happens,
+a **Canon card (CR3 to DNG)** checkbox appears above the plan rows, already
+ticked, with the reason shown beside it (for example, `found 1719 CR3
+files`). Unticking it falls back to the ordinary Lightroom workflow, where
+the CR3s are just files with no RAW-backed stack to detect.
+
+With Canon ticked, the three plan rows describe a Canon import instead of an
+Olympus one - stacked photos from the camera, the frames converted to DNG for
+each of them, and loose CR3 files that belong to no stack - and **Convert CR3
+to DNG** plus the parallel conversion job count sit beside the checkbox.
+Turning DNG conversion off copies the CR3 frames as-is, matching `--no-dng`
+on the command line. Rendering with Helicon Focus, and its method, radius,
+and smoothing, live in the **Advanced** section described in step 5 above;
+those three Helicon controls stay disabled until **Render with Helicon
+Focus** is ticked.
+
+The GUI's Canon path has been exercised against the same camera and cards as
+`--canon-import` itself; see
+[Canon in-camera depth-composite stacks](#canon-in-camera-depth-composite-stacks)
+for exactly what that means.
 
 ### Update notifications
 
@@ -520,7 +546,7 @@ Date filters work with all modes and use filesystem modification dates. In `--li
 - `-v` / `--verbose` - Show detailed info about each file processed
 - `-i` / `--interactive` - Ask for confirmation before moving (`--lightroomimport` only)
 - `--leave-on-card` - Copy during `--lightroomimport` instead of moving, leaving source files in place
-- `--plan-json` - With `--lightroomimport`, scan and emit one JSON import plan without moving or copying files
+- `--plan-json` - With `--lightroomimport` or `--canon-import`, scan and emit one JSON import plan without moving or copying files. It's the same payload shape both ways (plus mode-specific fields), which is what lets the GUI preview either kind of card with one code path.
 - `--force` - Overwrite existing files without asking
 - `-j N` / `--jobs N` - Set the parallel worker count. `--copy` and `--stackcopy` default to one worker unless this option is supplied. During a normal run, `--lightroom` automatically chooses up to 4 workers when its effective worker count is still 1. `--lightroomimport` always forces sequential execution to preserve oldest-first order. Values above 2x the CPU count are capped.
 - `--debug-stacks` / `--debugstacks` - Show detailed diagnostics for stack detection
@@ -536,6 +562,8 @@ These only apply with `--canon-import` and error out if used with any other mode
 - `--no-dng` - Copy CR3 frames as-is instead of converting them to DNG; skips Adobe DNG Converter discovery and the preflight check entirely
 - `--render-helicon` - After importing, render each stack with Helicon Focus to `<stack> helicon.jpg` beside its folder
 - `--helicon-method {0,1,2}` - Helicon rendering method A/B/C (default: `2`, method C)
+- `--helicon-radius N` - Helicon Focus radius (default: `8`, Helicon's own default)
+- `--helicon-smoothing N` - Helicon Focus smoothing (default: `4`, Helicon's own default)
 
 ## Stack detection in Lightroom modes
 
@@ -698,12 +726,16 @@ reported and skipped, and every other stack still proceeds.
 into a finished `.jpg`. Stackcopy looks for it via the `STACKCOPY_HELICON`
 environment variable, then the standard install location for your platform;
 there is no `PATH` fallback. Rendering uses Helicon's default method C
-(`--helicon-method 2`; pass `0` or `1` for methods A or B). Stackcopy hands
-Helicon an explicit list of frame files rather than pointing it at the stack
-folder, because that folder also holds the camera's own composite JPG, which
-must never be treated as one of the raw inputs to a fresh render. An existing
-render is left alone, so an interrupted run resumes without redoing finished
-stacks.
+(`--helicon-method 2`; pass `0` or `1` for methods A or B), and Helicon's own
+radius and smoothing defaults (`--helicon-radius 8`, `--helicon-smoothing 4`)
+unless overridden. Stackcopy hands Helicon an explicit list of frame files
+rather than pointing it at the stack folder, because that folder also holds
+the camera's own composite JPG, which must never be treated as one of the raw
+inputs to a fresh render. A stack with fewer than two frames is skipped with
+a message instead of sent to Helicon, which would otherwise exit non-zero and
+be reported as a failure for a render that was never possible in the first
+place. An existing render is left alone, so an interrupted run resumes
+without redoing finished stacks.
 
 ## Safety and recovery
 
@@ -774,8 +806,8 @@ If you run stackcopy inside WSL against files under `/mnt/c/`, `/mnt/d/`, etc., 
 
 ## Version
 
-- **Version**: 1.7.0
-- **Date**: September 10, 2026
+- **Version**: 1.8.0
+- **Date**: September 18, 2026
 - **Author**: Alan Rockefeller
 - **Repository**: https://github.com/AlanRockefeller/stackcopy
 - **License**: MIT

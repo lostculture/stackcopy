@@ -1,5 +1,45 @@
 # Change Log
 
+## **1.8.0 - 2026-09-18**
+
+- **The GUI now handles Canon depth-composite cards.** A card with CR3 files is
+  detected automatically as soon as it is scanned - the same scan that already
+  runs for every card - and the Canon controls (convert to DNG, parallel
+  conversion jobs) appear on the main panel with the reason shown alongside the
+  checkbox (e.g. "found 1719 CR3 files"). Helicon Focus's method, radius and
+  smoothing live in the existing Advanced section and stay disabled until
+  rendering is turned on. The three plan rows are reworded for a Canon import
+  (stacked photos from the camera, frames converted to DNG, loose CR3 files)
+  instead of reusing the Olympus wording. This is driven entirely by
+  `--canon-import --plan-json`, which now reports the same payload shape
+  `--lightroomimport --plan-json` already did, with `mode`, `dest_stacks`,
+  `dest_singles`, `unresolved` and `canon_frames_detected` added.
+  `--lightroomimport --plan-json` also now reports `canon_frames_detected`, so
+  a first-ever scan of a Canon card - before the user has ever run
+  `--canon-import` - is enough for the GUI to offer the Canon checkbox.
+  Nothing about the existing Olympus/OM plan payload changed beyond that one
+  additive field.
+- **A Canon import now reports progress**, using the same mechanism the
+  Lightroom import already used, so the GUI's running view (phase, current
+  file, counts, ETA) works for Canon cards exactly as it does for Olympus
+  ones. Before this change a Canon import emitted no progress at all; a
+  measured 1719-frame import ran three hours and forty-seven minutes against a
+  blank progress bar.
+- **Helicon Focus is no longer invoked for a one-frame stack.** There is
+  nothing to composite, and Helicon exits non-zero when asked to try; that
+  used to be reported as a render failure. It is now skipped with an explicit
+  message ("N frame(s), nothing to stack") instead, found from a real card
+  that produced two such one-frame stacks.
+- **Two new `--canon-import` flags tune Helicon Focus's render**:
+  `--helicon-radius N` and `--helicon-smoothing N`, defaulting to Helicon's
+  own defaults of 8 and 4. Like `--helicon-method`, both are rejected outside
+  `--canon-import`.
+- The GUI's Canon path - detection, controls, progress, and the flags above -
+  has so far been exercised against the same single camera body and cards as
+  the underlying `--canon-import` detection: the Canon EOS R6 Mark II, on two
+  cards. The Olympus/OM workflow itself is unchanged by this release, aside
+  from the one additive `canon_frames_detected` field on its plan payload.
+
 ## **1.7.0 - 2026-09-10**
 
 - **Added `--canon-import SRC_DIR DEST_DIR`**, a new mode for Canon in-camera depth-composite focus stacks. It detects each composite JPG via the `FocusBracketingDepthComposite` MakerNote, then finds its exact CR3 frames by matching `SubSecDateTimeOriginal` against the composite's own timestamp - not by the camera's configured `FocusBracketingImageCount`, which is the camera's setting rather than the true frame count and is reported only as an informational note. When no frame's timestamp matches, a cadence fallback groups frames by a threshold relative to the run's own recent shot interval. A stack may span a camera folder rollover (`107EOSR6` into `108EOSR6`), with the previous folder scanned only as borrowable context. ExifTool is optional here exactly as it already is for Olympus/OM detection; without it, detection falls back to the cadence heuristic. The card is never modified - everything is a copy.
