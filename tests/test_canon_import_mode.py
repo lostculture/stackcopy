@@ -1142,7 +1142,9 @@ def test_no_dng_frame_copies_are_reported_and_reach_full_progress(
 
     assert exit_code == 0
     frame_names = {
-        filename for fields, filename in events if fields.get("role") == "frames"
+        filename
+        for fields, filename in events
+        if fields.get("role") == "stack_input"
     }
     assert frame_names == {"IMG_0001.CR3", "IMG_0002.CR3"}, (
         "each raw frame copy under --no-dng must emit its own progress event, "
@@ -1549,11 +1551,18 @@ class HeliconTuningFlagsTests(unittest.TestCase):
         self.assertEqual(args.helicon_smoothing, helicon_focus.DEFAULT_SMOOTHING)
 
     def test_they_are_canon_only(self):
+        """Guarded by the one shared validator, not by parse_arguments.
+
+        All six Canon-only flags used to be checked in two different
+        places; they now share ``validate_canon_only_flags``, which main()
+        calls. parse_arguments itself no longer rejects them.
+        """
         parser = stackcopy.build_parser()
+        args = stackcopy.parse_arguments(
+            ["--rename", "somedir", "--helicon-radius", "6"], parser=parser
+        )
         with self.assertRaises(SystemExit):
-            stackcopy.parse_arguments(
-                ["--rename", "somedir", "--helicon-radius", "6"], parser=parser
-            )
+            stackcopy.validate_canon_only_flags(parser, args)
 
 
 class SingleFrameRenderSkipTests(unittest.TestCase):
@@ -1626,3 +1635,150 @@ class CanonProgressTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _one_frame_stack_plan(tmp_path):
+    """A stack with exactly ONE frame: real bytes, nothing to blend."""
+    src = tmp_path / "src"
+    src.mkdir(exist_ok=True)
+    (src / "IMG_0101.CR3").write_bytes(b"only-frame")
+    (src / "IMG_0101.JPG").write_bytes(b"composite")
+    stack_dir = tmp_path / "dst" / "2026-01-01" / "IMG_0101"
+    plan = stackcopy.CanonImportPlan(
+        stacks=(
+            stackcopy.CanonPlannedStack(
+                dest_dir=str(stack_dir),
+                jpg_src=str(src / "IMG_0101.JPG"),
+                jpg_dest=str(stack_dir / "IMG_0101.JPG"),
+                frame_sources=(str(src / "IMG_0101.CR3"),),
+            ),
+        ),
+        singles=(), single_sources=(), unresolved=(),
+    )
+    return plan, stack_dir
+
+
+def test_a_one_frame_stack_is_never_handed_to_helicon(
+    tmp_path, monkeypatch, capsys
+):
+    """The call site, not just the predicate.
+
+    ``canon_stack_is_renderable`` had two unit tests and no caller test:
+    forcing it to ``return True`` broke only those two, while the behaviour
+    it exists for -- run_canon_import declining to launch Helicon on a stack
+    with nothing to blend -- went unasserted. This drives the real run with
+    a stub Helicon and asserts it is never called, that the skip is
+    reported, and that ``done`` still reaches ``total`` (a stack excluded
+    from render_total must also be excluded from the render loop's
+    increments, or the GUI's bar stalls short forever).
+    """
+    plan, stack_dir = _one_frame_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
+    )
+
+    calls = []
+
+    def fake_render_stack(helicon, frames, output_path, **kwargs):
+        calls.append(output_path)
+        return stackcopy.helicon_focus.RenderResult(output_path, rendered=True)
+
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "render_stack", fake_render_stack
+    )
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--no-dng", "--render-helicon"]
+    )
+    exit_code, events = _progress_events(stackcopy.run_canon_import, args)
+    output = capsys.readouterr().out
+
+    assert calls == [], "Helicon must never be launched for a one-frame stack"
+    assert exit_code == 0, "a skip is not a failure"
+    assert "Skipped Helicon" in output
+    assert "1 frame(s), nothing to stack" in output
+    assert not (stack_dir.parent / f"{stack_dir.name} helicon.jpg").exists()
+    last_fields, _ = events[-1]
+    assert last_fields["phase"] == "done"
+    assert last_fields["done"] == last_fields["total"], (
+        "a skipped render must leave done == total: "
+        f"got done={last_fields['done']} total={last_fields['total']}"
+    )
+
+
+def test_canon_progress_drives_the_guis_real_counters(tmp_path, monkeypatch):
+    """End-to-end: the CLI's real lines through the GUI's real dispatcher.
+
+    The two halves used to speak different vocabularies -- the CLI emitted
+    role=stacked|frames|single|render and phase=convert|render, none of
+    which the GUI acted on -- so a real import showed 0 stacked photos and
+    0 frames for its whole run. Nothing asserted the two agreed, because
+    no test ever fed one's output to the other.
+    """
+    plan, _stack_dir = _one_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"), "--no-dng"]
+    )
+    captured = io.StringIO()
+    with mock.patch.object(stackcopy, "_PROGRESS_ENABLED", True), \
+         mock.patch.object(stackcopy.sys, "stderr", captured):
+        stackcopy.run_canon_import(args)
+    lines = [
+        ln for ln in captured.getvalue().splitlines()
+        if ln.startswith(gui.PROGRESS_SENTINEL)
+    ]
+
+    window = mock.Mock(spec=gui.StackcopyGUI)
+    window._total = 0
+    window._done = 0
+    window._current_role = None
+    window._bucket_done = {
+        "stack_output": 0, "stack_input": 0, "other": 0, "render": 0,
+    }
+    window._degraded = False
+    window._plan = {
+        "mode": "canon-import", "stacks": 1, "stacked_outputs": 1,
+        "stack_inputs": 2, "others": 0, "total": 3, "bytes": 0,
+    }
+    window.progress = mock.Mock()
+    window.phase_var = mock.Mock()
+    window.current_file_var = mock.Mock()
+    for line in lines:
+        gui.StackcopyGUI._handle_progress(window, line)
+
+    assert window._bucket_done == {
+        "stack_output": 1, "stack_input": 2, "other": 0, "render": 0,
+    }
+    assert window._done == 3
+    window.progress.set.assert_called_with(1.0)
+
+
+def test_canon_plan_payload_reports_exiftool_like_every_other_plan(
+    tmp_path, monkeypatch
+):
+    """The header strip's ExifTool warning must not vanish in Canon mode.
+
+    Without ExifTool, Canon stack detection degrades silently to a cadence
+    heuristic -- so this is the mode where the warning matters most.
+    """
+    monkeypatch.setattr(
+        stackcopy, "exiftool_plan_status",
+        lambda info=None: {
+            "exiftool_status": "missing",
+            "exiftool_version_label": "",
+            "exiftool_source": "",
+        },
+    )
+    plan = stackcopy.CanonImportPlan(
+        stacks=(), singles=(), single_sources=(), unresolved=()
+    )
+    payload = stackcopy.canon_plan_payload(plan, "D", "S", 0)
+
+    assert payload["exiftool_status"] == "missing"
+    assert gui.exiftool_status_display(payload) is not None

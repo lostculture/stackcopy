@@ -176,6 +176,7 @@ class StatePreservationTests(unittest.TestCase):
             detect_stacks_var=SimpleNamespace(get=lambda: True),
             debug_stacks_var=SimpleNamespace(get=lambda: False),
             canon_mode_var=SimpleNamespace(get=lambda: False),
+            _canon_mode_auto=False,
             canon_dng_var=SimpleNamespace(get=lambda: True),
             canon_dng_jobs_var=SimpleNamespace(get=lambda: "1"),
             canon_render_var=SimpleNamespace(get=lambda: False),
@@ -226,6 +227,7 @@ class StatePreservationTests(unittest.TestCase):
     def test_canon_settings_are_persisted_alongside_the_rest(self):
         written, _ = self.save({})
         self.assertIs(written["canon_mode"], False)
+        self.assertIs(written["canon_mode_auto"], False)
         self.assertIs(written["canon_dng"], True)
         self.assertEqual(written["canon_dng_jobs"], "1")
         self.assertIs(written["canon_render"], False)
@@ -839,59 +841,101 @@ class CanonSectionConstructionTests(unittest.TestCase):
 
 
 class CanonDetectionTests(unittest.TestCase):
-    """``_apply_canon_detection`` shows/hides the block and states why."""
+    """``_apply_canon_detection`` shows/hides the block and states why.
 
-    def make_target(self, plan, mode_initial=False):
-        state = {"gridded": True}
+    Driven through ``mock.Mock(spec=gui.StackcopyGUI)`` rather than a bare
+    ``SimpleNamespace``: a namespace stub raises AttributeError the moment
+    the method under test calls a collaborator the stub does not list, so a
+    correct fix that calls one more method fails as though it were a bug.
+    A spec'd Mock accepts any real method of the class.
+    """
 
-        class Frame:
-            def grid(self):
-                state["gridded"] = True
-
-            def grid_remove(self):
-                state["gridded"] = False
-
-        reason = {}
-        saved = {"calls": 0}
-        target = SimpleNamespace(
-            _plan=plan,
-            canon_frame=Frame(),
-            canon_reason_var=SimpleNamespace(
-                set=lambda v: reason.__setitem__("value", v)
-            ),
-            canon_mode_var=SimpleNamespace(get=lambda: mode_initial, set=lambda v: None),
-            _save_current_defaults=lambda: saved.__setitem__(
-                "calls", saved["calls"] + 1
-            ),
-        )
-        return target, state, reason, saved
+    def make_target(self, plan, mode_initial=False, canon_auto=False):
+        window = mock.Mock(spec=gui.StackcopyGUI)
+        window._plan = plan
+        window._canon_mode_auto = canon_auto
+        window.canon_frame = mock.Mock()
+        window.canon_reason_var = mock.Mock()
+        window.canon_mode_var = mock.Mock()
+        window.canon_mode_var.get.return_value = mode_initial
+        window.plan_headline_vars = {
+            key: mock.Mock() for key in ("stack_output", "stack_input", "other")
+        }
+        window.plan_heading_var = mock.Mock()
+        return window
 
     def test_a_canon_card_reveals_the_block_and_reports_why(self):
-        plan = {"canon_frames_detected": 3}
-        target, state, reason, _ = self.make_target(plan)
-        gui.StackcopyGUI._apply_canon_detection(target)
-        self.assertTrue(state["gridded"])
-        self.assertEqual(reason["value"], "found 3 CR3 files")
+        window = self.make_target({"canon_frames_detected": 3})
+
+        gui.StackcopyGUI._apply_canon_detection(window)
+
+        window.canon_frame.grid.assert_called_once_with()
+        window.canon_frame.grid_remove.assert_not_called()
+        window.canon_reason_var.set.assert_called_once_with("found 3 CR3 files")
 
     def test_a_non_canon_card_keeps_the_block_hidden(self):
-        target, state, reason, _ = self.make_target(None)
-        gui.StackcopyGUI._apply_canon_detection(target)
-        self.assertFalse(state["gridded"])
-        self.assertEqual(reason["value"], "")
+        window = self.make_target(None)
+
+        gui.StackcopyGUI._apply_canon_detection(window)
+
+        window.canon_frame.grid_remove.assert_called_once_with()
+        window.canon_frame.grid.assert_not_called()
+        window.canon_reason_var.set.assert_called_once_with("")
 
     def test_detection_turns_the_checkbox_on_and_saves(self):
-        plan = {"canon_frames_detected": 1}
-        target, _state, _reason, saved = self.make_target(plan)
-        set_calls = []
-        target.canon_mode_var.set = lambda v: set_calls.append(v)
-        gui.StackcopyGUI._apply_canon_detection(target)
-        self.assertEqual(set_calls, [True])
-        self.assertEqual(saved["calls"], 1)
+        window = self.make_target({"canon_frames_detected": 1})
+
+        gui.StackcopyGUI._apply_canon_detection(window)
+
+        window.canon_mode_var.set.assert_called_once_with(True)
+        window._save_current_defaults.assert_called_once_with()
+        self.assertTrue(window._canon_mode_auto)
 
     def test_a_manually_checked_box_keeps_the_block_visible_without_cr3s(self):
-        target, state, _reason, _saved = self.make_target(None, mode_initial=True)
-        gui.StackcopyGUI._apply_canon_detection(target)
-        self.assertTrue(state["gridded"])
+        window = self.make_target(None, mode_initial=True)
+
+        gui.StackcopyGUI._apply_canon_detection(window)
+
+        window.canon_frame.grid.assert_called_once_with()
+        window.canon_mode_var.set.assert_not_called()
+        self.assertFalse(window._canon_mode_auto)
+
+    def test_an_automatic_tick_blanks_the_stale_olympus_counts(self):
+        """R19: the rows under the checkbox came from the scan that just ran.
+
+        That scan was ``--lightroomimport``, so its ``stack_inputs`` is an
+        ORF frame count, not a CR3 one. Rewording those numbers as Canon
+        numbers would fabricate a figure, so the counts go away entirely.
+        """
+        window = self.make_target({"canon_frames_detected": 9, "stack_inputs": 30})
+
+        gui.StackcopyGUI._apply_canon_detection(window)
+
+        shown = [
+            call.args[0]
+            for var in window.plan_headline_vars.values()
+            for call in var.set.call_args_list
+        ]
+        self.assertEqual(len(shown), 3)
+        for text in shown:
+            self.assertNotIn("30", text)
+            self.assertNotIn("9", text)
+        self.assertEqual(list(shown), list(gui.plan_row_labels(None)))
+        heading = window.plan_heading_var.set.call_args.args[0]
+        self.assertIn("rescan", heading.lower())
+
+    def test_an_already_canon_plan_keeps_its_own_counts(self):
+        """Nothing is stale when the plan already describes a Canon import."""
+        window = self.make_target(
+            {"mode": gui.CANON_MODE, "canon_frames_detected": 9, "stack_inputs": 9}
+        )
+
+        gui.StackcopyGUI._apply_canon_detection(window)
+
+        window.canon_mode_var.set.assert_called_once_with(True)
+        for var in window.plan_headline_vars.values():
+            var.set.assert_not_called()
+        window.plan_heading_var.set.assert_not_called()
 
 
 class HeliconToggleTests(unittest.TestCase):
@@ -1082,3 +1126,179 @@ class CanonFieldSaveWiringTests(unittest.TestCase):
         target.canon_radius_var.fire()
         target.canon_smoothing_var.fire()
         self.assertEqual(calls, ["scheduled", "scheduled", "scheduled"])
+
+
+class DestinationRowButtonTests(unittest.TestCase):
+    """``_browse_destination`` edits the row it was clicked on."""
+
+    def make_window(self, chosen):
+        window = mock.Mock(spec=gui.StackcopyGUI)
+        window.dst_var = mock.Mock()
+        window.dst_var.get.return_value = "/pictures/stacks"
+        window.stk_var = mock.Mock()
+        window.stk_var.get.return_value = "/pictures/singles"
+        window.plan_path_targets = {
+            "stack_output": window.dst_var,
+            "stack_input": window.dst_var,
+            "other": window.stk_var,
+        }
+
+        def fake_browse(variable, _title):
+            if chosen is not None:
+                variable.get.return_value = chosen
+                variable.set(chosen)
+
+        window._browse.side_effect = fake_browse
+        return window
+
+    def test_the_canon_singles_row_edits_the_singles_folder(self):
+        """Bound at build time this row edited the stacks destination.
+
+        Row 3 in Canon mode is "loose CR3 files", showing dest_singles; the
+        build-time binding pointed it at ``dst_var``, so choosing a folder
+        here silently relocated the entire stacks destination instead.
+        """
+        window = self.make_window("/elsewhere/singles")
+
+        gui.StackcopyGUI._browse_destination(window, "other")
+
+        window.stk_var.set.assert_called_once_with("/elsewhere/singles")
+        window.dst_var.set.assert_not_called()
+
+    def test_the_canon_frames_row_edits_the_stacks_folder(self):
+        window = self.make_window("/elsewhere/stacks")
+
+        gui.StackcopyGUI._browse_destination(window, "stack_input")
+
+        window.dst_var.set.assert_called_once_with("/elsewhere/stacks")
+        window.stk_var.set.assert_not_called()
+
+    def test_a_changed_folder_refreshes_the_rows(self):
+        """The row must show what was picked, not what it showed before."""
+        window = self.make_window("/elsewhere/stacks")
+
+        gui.StackcopyGUI._browse_destination(window, "stack_output")
+
+        window._on_path_changed.assert_called_once_with()
+
+    def test_a_cancelled_dialog_changes_nothing_but_still_redraws(self):
+        window = self.make_window(None)
+
+        gui.StackcopyGUI._browse_destination(window, "other")
+
+        window._on_path_changed.assert_not_called()
+        window._refresh_idle_plan.assert_called_once_with()
+
+
+class CanonStickyModeTests(unittest.TestCase):
+    """An automatic Canon tick unticks itself on a card that is not Canon."""
+
+    def make_window(self, payload, automatic=True, canon_mode=True):
+        window = mock.Mock(spec=gui.StackcopyGUI)
+        window._canon_mode_auto = automatic
+        window._plan_generation = 3
+        window.canon_mode_var = mock.Mock()
+        window.canon_mode_var.get.return_value = canon_mode
+        window.source_scan_var = mock.Mock()
+        window._payload = payload
+        return window
+
+    def test_an_empty_canon_plan_drops_back_to_lightroom_and_rescans(self):
+        payload = {"mode": gui.CANON_MODE, "total": 0, "canon_frames_detected": 0}
+        window = self.make_window(payload)
+
+        gui.StackcopyGUI._apply_plan(window, payload)
+
+        window.canon_mode_var.set.assert_called_once_with(False)
+        self.assertFalse(window._canon_mode_auto)
+        window._save_current_defaults.assert_called_once_with()
+        self.assertIsNone(window._plan)
+        self.assertEqual(window._plan_generation, 4)
+        window._schedule_plan_scan.assert_called_once_with()
+        # The stale "0 photos and videos" summary must never be shown.
+        window.source_scan_var.set.assert_not_called()
+
+    def test_a_hand_ticked_box_survives_an_empty_canon_plan(self):
+        payload = {"mode": gui.CANON_MODE, "total": 0, "bytes": 0,
+                   "canon_frames_detected": 0}
+        window = self.make_window(payload, automatic=False)
+
+        gui.StackcopyGUI._apply_plan(window, payload)
+
+        window.canon_mode_var.set.assert_not_called()
+        window._schedule_plan_scan.assert_not_called()
+        self.assertEqual(window._plan, payload)
+
+    def test_a_canon_plan_with_files_is_applied_normally(self):
+        payload = {"mode": gui.CANON_MODE, "total": 4, "bytes": 40,
+                   "canon_frames_detected": 3}
+        window = self.make_window(payload)
+
+        gui.StackcopyGUI._apply_plan(window, payload)
+
+        window.canon_mode_var.set.assert_not_called()
+        self.assertEqual(window._plan, payload)
+        window._refresh_idle_plan.assert_called_once_with()
+
+
+class CanonModeSectionTests(unittest.TestCase):
+    """The Move/Copy control is hidden where it does nothing."""
+
+    def make_window(self):
+        window = mock.Mock(spec=gui.StackcopyGUI)
+        window.mode_frame = mock.Mock()
+        return window
+
+    def test_canon_mode_hides_the_move_copy_section(self):
+        window = self.make_window()
+        gui.StackcopyGUI._sync_mode_section(window, True)
+        window.mode_frame.grid_remove.assert_called_once_with()
+        window.mode_frame.grid.assert_not_called()
+
+    def test_olympus_mode_shows_it(self):
+        window = self.make_window()
+        gui.StackcopyGUI._sync_mode_section(window, False)
+        window.mode_frame.grid.assert_called_once_with()
+        window.mode_frame.grid_remove.assert_not_called()
+
+
+class RunningSentenceWordingTests(unittest.TestCase):
+    """The running view must not say "Moving" during a Canon import."""
+
+    def make_window(self, canon, mode):
+        window = mock.Mock(spec=gui.StackcopyGUI)
+        window._pending = (["--canon-import"], "/d", "/s", False)
+        window.canon_mode_var = mock.Mock()
+        window.canon_mode_var.get.return_value = canon
+        window.mode_var = mock.Mock()
+        window.mode_var.get.return_value = mode
+        return window
+
+    def test_canon_always_says_copying_even_with_move_selected(self):
+        window = self.make_window(True, gui.MOVE_MODE)
+        sentence = gui.StackcopyGUI._current_file_sentence(
+            window, "IMG_0040.CR3", "other", None
+        )
+        self.assertTrue(sentence.startswith("Copying "))
+        self.assertNotIn("Moving", sentence)
+
+    def test_olympus_move_wording_is_unchanged(self):
+        window = self.make_window(False, gui.MOVE_MODE)
+        sentence = gui.StackcopyGUI._current_file_sentence(
+            window, "P8081885.ORF", "other", None
+        )
+        self.assertTrue(sentence.startswith("Moving "))
+
+    def test_the_convert_phase_describes_conversion_not_copying(self):
+        window = self.make_window(True, gui.MOVE_MODE)
+        sentence = gui.StackcopyGUI._current_file_sentence(
+            window, "IMG_0040", "stack_input", None, "convert"
+        )
+        self.assertIn("DNG", sentence)
+
+    def test_the_render_phase_names_helicon(self):
+        window = self.make_window(True, gui.MOVE_MODE)
+        sentence = gui.StackcopyGUI._current_file_sentence(
+            window, "IMG_0040 helicon.jpg", "render", None, "render"
+        )
+        self.assertIn("Helicon", sentence)

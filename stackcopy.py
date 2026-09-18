@@ -3190,7 +3190,7 @@ def canon_plan_payload(
             total_bytes += os.path.getsize(src)
         except OSError:
             pass
-    return {
+    payload = {
         "mode": "canon-import",
         "stackcopy_version": STACKCOPY_VERSION,
         "total": len(plan.stacks) + frame_count + len(plan.singles),
@@ -3208,6 +3208,12 @@ def canon_plan_payload(
         "dest_dirs": dest_dirs,
         "dest_dates": dates,
     }
+    # The header strip renders these from every --lightroomimport plan.
+    # Omitting them here made the ExifTool warning vanish in the one mode
+    # where it matters most: without ExifTool, Canon stack detection
+    # silently degrades to a cadence heuristic.
+    payload.update(exiftool_plan_status())
+    return payload
 
 
 def _canon_scan_targets(source_dir: str) -> tuple[str, dict[str, str]]:
@@ -3513,7 +3519,8 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
             done += 1
             _emit_progress(
                 file=os.path.basename(stack.jpg_dest),
-                phase="copy", done=done, total=operation_total, role="stacked",
+                phase="copy", done=done, total=operation_total,
+                role="stack_output",
             )
             if converter is not None:
                 conversion_jobs.append((stack.dest_dir, list(stack.frame_sources)))
@@ -3530,7 +3537,7 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
                     _emit_progress(
                         file=os.path.basename(frame_dest),
                         phase="copy", done=done, total=operation_total,
-                        role="frames",
+                        role="stack_input",
                     )
         except Exception as error:
             # A failed group must never abort the run: report it and move on
@@ -3544,7 +3551,12 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
             done += result.converted + result.skipped
             _emit_progress(
                 file=os.path.basename(result.dest_dir),
-                phase="convert", done=done, total=operation_total, role="frames",
+                phase="convert", done=done, total=operation_total,
+                role="stack_input",
+                # One line covers a whole folder, so the GUI is told how
+                # many frames it stands for; without this the frames
+                # counter would advance once per stack, not once per frame.
+                count=result.converted + result.skipped,
             )
 
         results = dng_converter.convert_groups(
@@ -3570,7 +3582,7 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
             done += 1
             _emit_progress(
                 file=os.path.basename(dest),
-                phase="copy", done=done, total=operation_total, role="single",
+                phase="copy", done=done, total=operation_total, role="other",
             )
         except Exception as error:
             failed_singles += 1
@@ -3692,6 +3704,11 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
                 print(f"  Helicon failed: {display_path(output)}: {result.error}")
             elif args.verbose and result.rendered:
                 print(f"  Rendered {display_path(output)}")
+
+    # A terminal phase, exactly as --lightroomimport emits one. The GUI's
+    # progress bar only ever reaches 100% on this line; without it a
+    # finished Canon import leaves the bar wherever the last file put it.
+    _emit_progress(phase="done", done=done, total=operation_total)
 
     return 1 if (stack_failures or failed_singles or render_failures) else 0
 
@@ -3990,15 +4007,37 @@ def parse_arguments(
     if parser is None:
         parser = build_parser()
     args = parser.parse_args(argv)
+    return args
+
+
+def validate_canon_only_flags(parser, args) -> None:
+    """Reject the Canon-only flags when --canon-import was not asked for.
+
+    All six live here rather than half in ``parse_arguments`` and half in
+    ``main``: two validation paths for one rule is how a seventh flag ends
+    up guarded in neither. The messages are unchanged from where each
+    guard used to live.
+    """
+    if args.canon_import:
+        return
+    if args.singles_dir:
+        parser.error("--singles-dir can only be used with --canon-import.")
+    if args.dng_jobs != 1:
+        parser.error("--dng-jobs can only be used with --canon-import.")
+    if args.no_dng:
+        parser.error("--no-dng can only be used with --canon-import.")
+    if args.render_helicon:
+        parser.error("--render-helicon can only be used with --canon-import.")
+    if args.helicon_method != helicon_focus.DEFAULT_METHOD:
+        parser.error("--helicon-method can only be used with --canon-import.")
     if (
         args.helicon_radius != helicon_focus.DEFAULT_RADIUS
         or args.helicon_smoothing != helicon_focus.DEFAULT_SMOOTHING
-    ) and not args.canon_import:
+    ):
         parser.error(
             "--helicon-radius and --helicon-smoothing can only be used "
             "with --canon-import."
         )
-    return args
 
 
 def validate_plan_json_mode(parser, args) -> None:
@@ -4076,16 +4115,7 @@ def main():
         plan_json_stdout = sys.stdout
         sys.stdout = sys.stderr
 
-    if args.singles_dir and not args.canon_import:
-        parser.error("--singles-dir can only be used with --canon-import.")
-    if args.dng_jobs != 1 and not args.canon_import:
-        parser.error("--dng-jobs can only be used with --canon-import.")
-    if args.no_dng and not args.canon_import:
-        parser.error("--no-dng can only be used with --canon-import.")
-    if args.render_helicon and not args.canon_import:
-        parser.error("--render-helicon can only be used with --canon-import.")
-    if args.helicon_method != helicon_focus.DEFAULT_METHOD and not args.canon_import:
-        parser.error("--helicon-method can only be used with --canon-import.")
+    validate_canon_only_flags(parser, args)
 
     if args.debug_stacks:
         print(f"Running Stackcopy from: {os.path.abspath(__file__)}")

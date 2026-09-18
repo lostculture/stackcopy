@@ -205,10 +205,8 @@ def plan_row_labels(plan: dict[str, object] | None) -> tuple[str, str, str]:
     photos, the frames behind them, and everything left over - so only the
     nouns change.
 
-    The Olympus/Lightroom branch reproduces the wording the widget builds
-    inline today (see ``_refresh_idle_plan``) character for character,
-    example substitution included, so moving that logic here later changes
-    nothing an Olympus user sees.
+    The Olympus/Lightroom branch reproduces the wording Olympus users have
+    always seen character for character, example substitution included.
     """
     outputs = plan.get("stacked_outputs") if plan else None
     inputs = plan.get("stack_inputs") if plan else None
@@ -268,6 +266,62 @@ def detect_canon_mode(plan: dict[str, object] | None) -> tuple[bool, str]:
         return False, ""
     noun = "file" if count == 1 else "files"
     return True, f"found {count} CR3 {noun}"
+
+
+def destination_targets(mode: str) -> tuple[str, str, str]:
+    """Which saved destination each of the three plan rows actually edits.
+
+    The rows show different folders in the two modes - Canon puts the
+    composite and its frames in the *same* stacks folder and the loose CR3s
+    in the singles folder - so a "Change" button wired to a fixed variable
+    at build time edits a row the user is not looking at. Returning the
+    names here keeps the mapping in one testable place.
+
+    Names are the two persisted settings: "lightroom" (``dst_var``, the
+    Canon stacks destination) and "stack_input" (``stk_var``, the Canon
+    singles destination).
+    """
+    if mode == CANON_MODE:
+        return "lightroom", "lightroom", "stack_input"
+    return "lightroom", "stack_input", "lightroom"
+
+
+def canon_auto_untick(
+    plan: dict[str, object] | None, *, canon_mode: bool, automatic: bool
+) -> bool:
+    """Whether an automatically-ticked Canon box should be cleared again.
+
+    Canon mode is persisted, so without an inverse the next card inherits
+    it: a full Olympus card scanned with --canon-import reports nothing at
+    all, and the window offers to "Move 0 files" with no explanation. Only
+    a tick this program made itself is undone - one the photographer set by
+    hand is theirs to clear.
+    """
+    if not canon_mode or not automatic or not plan:
+        return False
+    if plan_mode(plan) != CANON_MODE:
+        return False
+    try:
+        return int(plan.get("total", 0) or 0) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def initial_activity_text(*, canon: bool, preview: bool) -> tuple[str, str]:
+    """The heading and sentence shown before the first progress line lands.
+
+    ``--canon-import --dry`` deliberately performs, and therefore reports,
+    nothing at all, so a Canon preview would otherwise sit on "Preparing…"
+    and "Waiting for Stackcopy…" until it exited. Say what is really
+    happening instead.
+    """
+    if canon and preview:
+        return (
+            "Previewing - nothing is being written",
+            "Stackcopy is checking the card and its destinations. No file is "
+            "copied, converted or rendered during a preview.",
+        )
+    return ("Preparing…", "Waiting for Stackcopy to finish its safety checks…")
 
 
 CANON_DEFAULT_DNG_JOBS = 1
@@ -426,12 +480,19 @@ def import_button_label(
     *,
     leave_on_card: bool,
     preview: bool = False,
+    canon: bool = False,
 ) -> str:
+    """The primary button's text.
+
+    ``--canon-import`` always copies and has no move/copy flag to pass, so
+    the Move wording is forced off in Canon mode rather than left to say a
+    card will be emptied when it never will be.
+    """
     if preview:
         return "Preview without moving anything"
     if plan is None:
         return "Start import"
-    action = "Copy" if leave_on_card else "Move"
+    action = "Copy" if (leave_on_card or canon) else "Move"
     return f"{action} {int(plan['total'])} files"
 
 
@@ -839,7 +900,9 @@ class StackcopyGUI(ctk.CTk):
         self._total = 0
         self._done = 0
         self._current_role: str | None = None
-        self._bucket_done = {"stack_output": 0, "stack_input": 0, "other": 0}
+        self._bucket_done = {
+            "stack_output": 0, "stack_input": 0, "other": 0, "render": 0,
+        }
         self._stack_indexes: dict[str, int] = {}
         self._active_stack_name: str | None = None
         self._update_info = None
@@ -872,6 +935,9 @@ class StackcopyGUI(ctk.CTk):
         )
         self.debug_stacks_var = ctk.BooleanVar(value=state_flag(saved, "debug_stacks"))
         self.canon_mode_var = ctk.BooleanVar(value=state_flag(saved, "canon_mode"))
+        # Whether that tick was made by detection rather than by the
+        # photographer. Only an automatic tick may be undone automatically.
+        self._canon_mode_auto = state_flag(saved, "canon_mode_auto")
         self.canon_reason_var = ctk.StringVar(value="")
         self.canon_dng_var = ctk.BooleanVar(
             value=state_flag(saved, "canon_dng", True)
@@ -1096,6 +1162,10 @@ class StackcopyGUI(ctk.CTk):
     def _build_mode_section(self) -> None:
         frame = ctk.CTkFrame(self.body, fg_color="transparent")
         frame.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 13))
+        # Kept as an attribute so Canon mode can hide the whole section:
+        # --canon-import always copies, so offering Move there states a
+        # destructive behaviour that will not happen.
+        self.mode_frame = frame
         frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             frame,
@@ -1163,12 +1233,17 @@ class StackcopyGUI(ctk.CTk):
         self.plan_headline_vars: dict[str, ctk.StringVar] = {}
         self.plan_path_vars: dict[str, ctk.StringVar] = {}
         self.destination_buttons: list[ctk.CTkButton] = []
+        # Which variable each row edits depends on the import mode, so it is
+        # resolved in _refresh_idle_plan and read at click time. Captured at
+        # build time instead, Canon's row 3 ("loose CR3 files") would quietly
+        # relocate the whole stacks destination.
+        self.plan_path_targets: dict[str, ctk.StringVar] = {}
         definitions = (
-            ("stack_output", "photo", self.dst_var),
-            ("stack_input", "frames", self.stk_var),
-            ("other", "folder", self.dst_var),
+            ("stack_output", "photo"),
+            ("stack_input", "frames"),
+            ("other", "folder"),
         )
-        for row, (key, icon, path_var) in enumerate(definitions):
+        for row, (key, icon) in enumerate(definitions):
             self._draw_icon(self.plan_rows, row * 2, icon)
             headline = ctk.StringVar()
             path_text = ctk.StringVar()
@@ -1192,9 +1267,7 @@ class StackcopyGUI(ctk.CTk):
             button = self._text_button(
                 self.plan_rows,
                 "Change",
-                lambda variable=path_var: self._browse(
-                    variable, "Choose a destination"
-                ),
+                lambda row_key=key: self._browse_destination(row_key),
             )
             button.grid(row=row * 2, column=2, rowspan=2, padx=(10, 14))
             self.destination_buttons.append(button)
@@ -1575,6 +1648,24 @@ class StackcopyGUI(ctk.CTk):
         if chosen:
             variable.set(chosen)
 
+    def _browse_destination(self, key: str) -> None:
+        """Change the folder the *named plan row* shows, not a fixed one.
+
+        The target is looked up now rather than bound when the button was
+        built, because the row/variable mapping differs between the two
+        import modes. The plan is refreshed afterwards so the row shows what
+        was actually picked.
+        """
+        variable = self.plan_path_targets.get(key)
+        if variable is None:
+            variable = self.dst_var
+        before = variable.get()
+        self._browse(variable, "Choose a destination")
+        if variable.get() != before:
+            self._on_path_changed()
+        else:
+            self._refresh_idle_plan()
+
     def _on_path_changed(self) -> None:
         self._schedule_save()
         self._plan_generation += 1
@@ -1634,7 +1725,23 @@ class StackcopyGUI(ctk.CTk):
             self.canon_frame.grid_remove()
         if detected and not self.canon_mode_var.get():
             self.canon_mode_var.set(True)
+            # Remember that detection ticked this, not the photographer: only
+            # an automatic tick is ever cleared automatically.
+            self._canon_mode_auto = True
             self._save_current_defaults()
+            self._sync_mode_section(True)
+            if plan_mode(self._plan) != CANON_MODE:
+                # The rows still hold the numbers from the Olympus-worded
+                # scan that just ran, and that scan's stack_inputs is not the
+                # Canon frame count - rewording in place would invent a
+                # figure. Blank the counts and say so instead.
+                stacked, frames, other = plan_row_labels(None)
+                self.plan_headline_vars["stack_output"].set(stacked)
+                self.plan_headline_vars["stack_input"].set(frames)
+                self.plan_headline_vars["other"].set(other)
+                self.plan_heading_var.set(
+                    "Canon card detected - rescan to see the Canon file counts"
+                )
 
     def _sync_mode_help(self) -> None:
         if self.mode_var.get() == COPY_MODE:
@@ -1665,6 +1772,7 @@ class StackcopyGUI(ctk.CTk):
                 "debug_stacks": bool(self.debug_stacks_var.get()),
                 "advanced_open": bool(self._advanced_open),
                 "canon_mode": bool(self.canon_mode_var.get()),
+                "canon_mode_auto": bool(self._canon_mode_auto),
                 "canon_dng": bool(self.canon_dng_var.get()),
                 "canon_dng_jobs": self.canon_dng_jobs_var.get(),
                 "canon_render": bool(self.canon_render_var.get()),
@@ -1844,16 +1952,55 @@ class StackcopyGUI(ctk.CTk):
         self.plan_path_vars["stack_output"].set(first_path)
         self.plan_path_vars["stack_input"].set(second_path)
         self.plan_path_vars["other"].set(third_path)
+        canon = bool(self.canon_mode_var.get())
+        variables = {"lightroom": self.dst_var, "stack_input": self.stk_var}
+        for key, target in zip(
+            ("stack_output", "stack_input", "other"),
+            destination_targets(CANON_MODE if canon else LIGHTROOM_MODE),
+        ):
+            self.plan_path_targets[key] = variables[target]
+        self._sync_mode_section(canon)
         self._refresh_dated_folders()
         self.start_btn.configure(
             text=import_button_label(
-                plan, leave_on_card=self.mode_var.get() == COPY_MODE
+                plan,
+                leave_on_card=self.mode_var.get() == COPY_MODE,
+                canon=canon,
             )
         )
         self._apply_canon_detection()
 
+    def _sync_mode_section(self, canon: bool) -> None:
+        """Show the Move/Copy control only where it does something.
+
+        In Canon mode the CLI is never handed a move flag, so leaving the
+        control live would let the window promise an emptied card it is
+        not going to deliver.
+        """
+        if canon:
+            self.mode_frame.grid_remove()
+        else:
+            self.mode_frame.grid()
+
     def _apply_plan(self, payload: dict[str, object] | None) -> None:
         self._plan = payload
+        if canon_auto_untick(
+            payload,
+            canon_mode=bool(self.canon_mode_var.get()),
+            automatic=self._canon_mode_auto,
+        ):
+            # A Canon scan that found nothing on a card we only guessed was
+            # Canon: drop back to the Lightroom import and scan again,
+            # rather than offering to "Move 0 files" from a full card.
+            self.canon_mode_var.set(False)
+            self._canon_mode_auto = False
+            self._save_current_defaults()
+            self._plan = None
+            self._plan_generation += 1
+            self._set_plan_scanning(False)
+            self._refresh_idle_plan()
+            self._schedule_plan_scan()
+            return
         self._refresh_exiftool_status()
         self._set_plan_scanning(False)
         if payload is None:
@@ -2024,7 +2171,9 @@ class StackcopyGUI(ctk.CTk):
         self._total = int(self._plan["total"]) if self._plan else 0
         self._done = 0
         self._current_role = None
-        self._bucket_done = {"stack_output": 0, "stack_input": 0, "other": 0}
+        self._bucket_done = {
+            "stack_output": 0, "stack_input": 0, "other": 0, "render": 0,
+        }
         self._stack_indexes = {}
         self._active_stack_name = None
         self._log_open = False
@@ -2043,11 +2192,14 @@ class StackcopyGUI(ctk.CTk):
         self.current_file_label.grid()
         self.progress.configure(mode="indeterminate")
         self.progress.start()
-        self.phase_var.set("Preparing…")
+        heading, sentence = initial_activity_text(
+            canon=bool(self.canon_mode_var.get()), preview=self._pending[3]
+        )
+        self.phase_var.set(heading)
         self.meta_var.set("")
         self.result_body_var.set("")
         self.result_body_label.grid_remove()
-        self.current_file_var.set("Waiting for Stackcopy to finish its safety checks…")
+        self.current_file_var.set(sentence)
         self._update_counter_cards()
         threading.Thread(target=self._worker, args=(command, env), daemon=True).start()
 
@@ -2167,10 +2319,20 @@ class StackcopyGUI(ctk.CTk):
             self.progress.set(0)
             self.phase_var.set("Preparing…" if total else "Nothing found")
             return
-        if phase in {"move", "copy"}:
+        # "convert" and "render" are Canon's own phases and mean exactly what
+        # "copy" means here: one more unit of the same operation_total is
+        # finished. Dropping them lost the DNG conversion entirely - the
+        # multi-hour part of a Canon import, and on by default.
+        if phase in {"move", "copy", "convert", "render"}:
             role = fields.get("role", "other")
             self._current_role = role if role in self._bucket_done else "other"
-            self._bucket_done[self._current_role] += 1
+            # One convert line stands for a whole folder of frames, so it
+            # says how many; everything else is one file per line.
+            try:
+                step = int(fields.get("count", "1") or 1)
+            except ValueError:
+                step = 1
+            self._bucket_done[self._current_role] += step
             self._done = done
             self._total = total or self._total
             output_name = fields.get("stack_output_name")
@@ -2180,10 +2342,10 @@ class StackcopyGUI(ctk.CTk):
                     self._stack_indexes[output_name] = len(self._stack_indexes) + 1
             if self._total:
                 self.progress.set(done / self._total)
-            self._set_phase_heading(self._current_role)
+            self._set_phase_heading(self._current_role, phase)
             self.current_file_var.set(
                 self._current_file_sentence(
-                    filename or "file", self._current_role, output_name
+                    filename or "file", self._current_role, output_name, phase
                 )
             )
             self._update_meta()
@@ -2196,8 +2358,14 @@ class StackcopyGUI(ctk.CTk):
             self.progress.set(done / self._total if self._total else 0)
             self._update_counter_cards()
 
-    def _set_phase_heading(self, role: str) -> None:
+    def _set_phase_heading(self, role: str, phase: str | None = None) -> None:
         plan_stacks = int(self._plan.get("stacks", 0)) if self._plan else 0
+        if phase == "convert":
+            self.phase_var.set("Converting frames to DNG")
+            return
+        if phase == "render" or role == "render":
+            self.phase_var.set("Rendering stacks with Helicon Focus")
+            return
         if role in {"stack_output", "stack_input"} and self._active_stack_name:
             current = self._stack_indexes.get(self._active_stack_name, 1)
             self.phase_var.set(
@@ -2211,13 +2379,23 @@ class StackcopyGUI(ctk.CTk):
             self.phase_var.set("Importing files…")
 
     def _current_file_sentence(
-        self, filename: str, role: str, output_name: str | None
+        self,
+        filename: str,
+        role: str,
+        output_name: str | None,
+        phase: str | None = None,
     ) -> str:
         assert self._pending is not None
         preview = self._pending[3]
+        if phase == "convert":
+            return f"Converting the frames of {filename} to DNG."
+        if phase == "render" or role == "render":
+            return f"Rendering {filename} with Helicon Focus."
         if preview:
             action = "Checking"
-        elif self.mode_var.get() == COPY_MODE:
+        # --canon-import always copies and is never passed a move flag, so
+        # the running view must never claim a file is being moved.
+        elif self.canon_mode_var.get() or self.mode_var.get() == COPY_MODE:
             action = "Copying"
         else:
             action = "Moving"
@@ -2264,7 +2442,11 @@ class StackcopyGUI(ctk.CTk):
             "stack_output": "stacked_outputs",
             "stack_input": "stack_inputs",
             "other": "others",
-        }[role]
+        }.get(role)
+        # "render" is counted but has no plan total of its own and no card
+        # to show it on, so it reports no denominator rather than raising.
+        if key is None or key not in self._plan:
+            return None
         return int(self._plan[key])
 
     def _update_counter_cards(self, problems: int = 0) -> None:

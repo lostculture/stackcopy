@@ -1,6 +1,7 @@
 """Display-free helper coverage for the explanatory GUI."""
 
 import json
+import re
 import sys
 import types
 import unittest
@@ -334,7 +335,9 @@ class ProgressParserTests(unittest.TestCase):
         window._total = 0
         window._done = 0
         window._current_role = None
-        window._bucket_done = {"stack_output": 0, "stack_input": 0, "other": 0}
+        window._bucket_done = {
+            "stack_output": 0, "stack_input": 0, "other": 0, "render": 0,
+        }
         window._degraded = False
         window._plan = plan_payload(
             total=5, stacked_outputs=1, stack_inputs=2, others=2
@@ -357,10 +360,79 @@ class ProgressParserTests(unittest.TestCase):
 
         self.assertEqual(
             window._bucket_done,
-            {"stack_output": 1, "stack_input": 2, "other": 2},
+            {"stack_output": 1, "stack_input": 2, "other": 2, "render": 0},
         )
         self.assertEqual(window._done, 5)
         window.progress.set.assert_called_with(1.0)
+
+    def test_a_canon_run_counts_each_lines_own_role_too(self):
+        """The same test, in --canon-import's vocabulary.
+
+        Canon emits phases the GUI once ignored entirely (``convert`` -- the
+        multi-hour part of a real import, and on by default -- and
+        ``render``), so every one of these lines used to be either dropped
+        or charged to "other". The stacked and frames counters read 0 for a
+        whole import and the singles counter overshot its own total.
+        """
+        window = mock.Mock(spec=gui.StackcopyGUI)
+        window._total = 0
+        window._done = 0
+        window._current_role = None
+        window._bucket_done = {
+            "stack_output": 0, "stack_input": 0, "other": 0, "render": 0,
+        }
+        window._degraded = False
+        window._plan = dict(CANON_PLAN)
+        window.progress = mock.Mock()
+        window.phase_var = mock.Mock()
+        window.current_file_var = mock.Mock()
+
+        lines = [
+            "@@SCPROGRESS phase=prepare done=0 total=6",
+            "@@SCPROGRESS phase=start done=0 total=6",
+            "@@SCPROGRESS phase=copy done=1 total=6 role=stack_output "
+            "file=IMG_0040.JPG",
+            "@@SCPROGRESS phase=convert done=3 total=6 role=stack_input count=2 "
+            "file=IMG_0040",
+            "@@SCPROGRESS phase=copy done=4 total=6 role=other file=IMG_0067.CR3",
+            "@@SCPROGRESS phase=render done=5 total=6 role=render "
+            "file=IMG_0040%20helicon.jpg",
+            "@@SCPROGRESS phase=done done=6 total=6",
+        ]
+        for line in lines:
+            gui.StackcopyGUI._handle_progress(window, line)
+
+        self.assertEqual(
+            window._bucket_done,
+            {"stack_output": 1, "stack_input": 2, "other": 1, "render": 1},
+        )
+        self.assertEqual(window._done, 6)
+        window.progress.set.assert_called_with(1.0)
+
+    def test_every_role_the_cli_emits_has_a_counter_bucket(self):
+        """Structural guard: the two halves must share one role vocabulary.
+
+        The GUI coerces any role it does not recognise to "other", so a
+        renamed or newly-introduced role on the CLI side is silently
+        mis-counted rather than failing anywhere. Read the literals out of
+        stackcopy.py instead of trusting a list written by hand.
+        """
+        source = Path(stackcopy.__file__).read_text(encoding="utf-8")
+        emitted = set(re.findall(r'role="([A-Za-z_]+)"', source))
+        self.assertTrue(emitted, "no role= literals found; the regex is wrong")
+        gui_source = Path(gui.__file__).read_text(encoding="utf-8")
+        bucket_literal = re.search(
+            r"_bucket_done = \{(.*?)\}", gui_source, re.S
+        )
+        self.assertIsNotNone(bucket_literal, "could not find _bucket_done")
+        buckets = set(re.findall(r'"([A-Za-z_]+)":', bucket_literal.group(1)))
+        self.assertTrue(buckets, "no bucket keys found; the regex is wrong")
+        self.assertEqual(
+            emitted - buckets,
+            set(),
+            "these roles are emitted by stackcopy.py but have no bucket in "
+            "the GUI's _bucket_done, so they are counted as 'other'",
+        )
 
 
 class ButtonLabelTests(unittest.TestCase):
@@ -672,3 +744,108 @@ class CanonImportArgsTests(unittest.TestCase):
             with self.subTest(**kwargs):
                 parser.parse_args(gui.canon_import_args("S", "D", "G", **kwargs))
 
+
+
+class DestinationTargetTests(unittest.TestCase):
+    """Which saved folder each plan row's Change button actually edits."""
+
+    def test_olympus_rows_edit_lightroom_stack_input_lightroom(self):
+        self.assertEqual(
+            gui.destination_targets(gui.LIGHTROOM_MODE),
+            ("lightroom", "stack_input", "lightroom"),
+        )
+
+    def test_canon_rows_follow_the_paths_canon_actually_displays(self):
+        """Canon shows (stacks, stacks, singles), so row 3 is the odd one.
+
+        Bound to the Olympus mapping instead, Change on the "loose CR3
+        files" row silently relocates the entire stacks destination and
+        Change on the frames row edits the singles folder -- a 65 GB import
+        landing somewhere the photographer never chose.
+        """
+        self.assertEqual(
+            gui.destination_targets(gui.CANON_MODE),
+            ("lightroom", "lightroom", "stack_input"),
+        )
+
+    def test_the_two_modes_do_not_share_a_mapping(self):
+        self.assertNotEqual(
+            gui.destination_targets(gui.CANON_MODE),
+            gui.destination_targets(gui.LIGHTROOM_MODE),
+        )
+
+
+class CanonAutoUntickTests(unittest.TestCase):
+    """An automatic Canon tick must not outlive the card that caused it."""
+
+    EMPTY_CANON = {"mode": gui.CANON_MODE, "total": 0, "canon_frames_detected": 0}
+
+    def test_an_automatic_tick_is_cleared_when_canon_finds_nothing(self):
+        self.assertTrue(
+            gui.canon_auto_untick(
+                self.EMPTY_CANON, canon_mode=True, automatic=True
+            )
+        )
+
+    def test_a_hand_set_tick_is_left_alone(self):
+        self.assertFalse(
+            gui.canon_auto_untick(
+                self.EMPTY_CANON, canon_mode=True, automatic=False
+            )
+        )
+
+    def test_a_canon_plan_with_files_keeps_the_tick(self):
+        self.assertFalse(
+            gui.canon_auto_untick(CANON_PLAN, canon_mode=True, automatic=True)
+        )
+
+    def test_an_olympus_plan_never_triggers_it(self):
+        """Only a Canon scan's own emptiness is evidence about Canon mode."""
+        empty_olympus = {"total": 0}
+        self.assertFalse(
+            gui.canon_auto_untick(empty_olympus, canon_mode=True, automatic=True)
+        )
+
+    def test_no_plan_and_unticked_mode_do_nothing(self):
+        self.assertFalse(
+            gui.canon_auto_untick(None, canon_mode=True, automatic=True)
+        )
+        self.assertFalse(
+            gui.canon_auto_untick(
+                self.EMPTY_CANON, canon_mode=False, automatic=True
+            )
+        )
+
+
+class CanonImportButtonLabelTests(unittest.TestCase):
+    def test_canon_mode_never_offers_to_move(self):
+        """--canon-import copies; the button must not promise otherwise."""
+        self.assertEqual(
+            gui.import_button_label(CANON_PLAN, leave_on_card=False, canon=True),
+            "Copy 1790 files",
+        )
+
+    def test_olympus_is_unchanged(self):
+        self.assertEqual(
+            gui.import_button_label(plan_payload(), leave_on_card=False),
+            "Move 348 files",
+        )
+
+
+class PreviewActivityTextTests(unittest.TestCase):
+    def test_a_canon_preview_says_nothing_is_being_written(self):
+        """--canon-import --dry emits no progress at all, by design."""
+        heading, sentence = gui.initial_activity_text(canon=True, preview=True)
+        self.assertIn("nothing is being written", heading.lower())
+        self.assertIn("preview", sentence.lower())
+
+    def test_every_other_combination_keeps_the_old_wording(self):
+        for canon, preview in ((False, True), (True, False), (False, False)):
+            with self.subTest(canon=canon, preview=preview):
+                self.assertEqual(
+                    gui.initial_activity_text(canon=canon, preview=preview),
+                    (
+                        "Preparing…",
+                        "Waiting for Stackcopy to finish its safety checks…",
+                    ),
+                )
