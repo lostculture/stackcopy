@@ -19,12 +19,31 @@
   `--canon-import` - is enough for the GUI to offer the Canon checkbox.
   Nothing about the existing Olympus/OM plan payload changed beyond that one
   additive field.
-- **A Canon import now reports progress**, using the same mechanism the
-  Lightroom import already used, so the GUI's running view (phase, current
-  file, counts, ETA) works for Canon cards exactly as it does for Olympus
-  ones. Before this change a Canon import emitted no progress at all; a
-  measured 1719-frame import ran three hours and forty-seven minutes against a
-  blank progress bar.
+- **A Canon import now reports progress**, using the same mechanism and the
+  same role vocabulary the Lightroom import already used, so the GUI's
+  running view - phase, current file, the stacked/frames/singles counters,
+  the bar and the ETA - is driven by a Canon import as it is by an Olympus
+  one. DNG conversion and Helicon rendering report as their own phases
+  ("Converting frames to DNG", "Rendering stacks with Helicon Focus"), and
+  the run ends on an explicit terminal event so the bar reaches 100%. Before
+  this change a Canon import emitted no progress at all; a measured
+  1719-frame import ran three hours and forty-seven minutes against a blank
+  progress bar. One difference remains by design: `--canon-import --dry`
+  performs nothing and so reports nothing, and the GUI says so explicitly
+  ("Previewing - nothing is being written") rather than showing a live file
+  list a preview does not produce.
+- **Canon mode no longer misdirects the destination buttons or the Move/Copy
+  control.** Each plan row's "Change" button now edits the folder that row
+  actually displays, in both modes. The Move/Copy control is hidden in Canon
+  mode, where `--canon-import` always copies and is never passed a move
+  flag, and the button and running view say Copy accordingly.
+- **An automatically-ticked Canon box unticks itself again.** If detection
+  ticked the box and the next card's Canon scan finds nothing, the GUI drops
+  back to the Lightroom import and rescans instead of reporting an empty
+  plan for a full card. A box ticked by hand is left alone.
+- The Canon plan payload now carries the same ExifTool capability fields
+  every Lightroom plan does, so the header strip's ExifTool warning no
+  longer disappears in Canon mode.
 - **Helicon Focus is no longer invoked for a one-frame stack.** There is
   nothing to composite, and Helicon exits non-zero when asked to try; that
   used to be reported as a render failure. It is now skipped with an explicit
@@ -35,9 +54,10 @@
   own defaults of 8 and 4. Like `--helicon-method`, both are rejected outside
   `--canon-import`.
 - The GUI's Canon path - detection, controls, progress, and the flags above -
-  has so far been exercised against the same single camera body and cards as
-  the underlying `--canon-import` detection: the Canon EOS R6 Mark II, on two
-  cards. The Olympus/OM workflow itself is unchanged by this release, aside
+  has so far been exercised against the same single camera body as the
+  underlying `--canon-import` detection: the Canon EOS R6 Mark II. How many
+  distinct cards that covers is not recorded anywhere in this repository, so
+  no count is claimed. The Olympus/OM workflow itself is unchanged, aside
   from the one additive `canon_frames_detected` field on its plan payload.
 
 ## **1.7.0 - 2026-09-10**

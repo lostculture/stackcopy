@@ -137,7 +137,7 @@ and where to get a newer converter - instead of failing partway through a
 
 This detection and conversion path, including the GUI controls described
 below, has so far been exercised against a single camera body, the Canon EOS
-R6 Mark II, on two test cards. Detection itself relies only on the
+R6 Mark II. Detection itself relies only on the
 `FocusBracketingDepthComposite` and
 `FocusBracketingImageCount` MakerNotes and Canon's standard `IMG_####.CR3`
 file numbering, so any body that writes those the same way is reading the
