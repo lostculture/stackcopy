@@ -3174,11 +3174,27 @@ def canon_plan_payload(
     frame_count = sum(len(stack.frame_sources) for stack in plan.stacks)
     dates = sorted({os.path.basename(os.path.dirname(s.dest_dir)) for s in plan.stacks})
     dest_dirs = sorted({os.path.dirname(s.dest_dir) for s in plan.stacks})
+    # Same technique --lightroomimport's own plan-json bytes total uses:
+    # sum the real size of every source file this plan will copy, failing
+    # closed (skip, don't crash) on a file that vanishes between the scan
+    # and here.
+    total_bytes = 0
+    for stack in plan.stacks:
+        for src in (stack.jpg_src, *stack.frame_sources):
+            try:
+                total_bytes += os.path.getsize(src)
+            except OSError:
+                pass
+    for src in plan.single_sources:
+        try:
+            total_bytes += os.path.getsize(src)
+        except OSError:
+            pass
     return {
         "mode": "canon-import",
         "stackcopy_version": STACKCOPY_VERSION,
         "total": len(plan.stacks) + frame_count + len(plan.singles),
-        "bytes": 0,
+        "bytes": total_bytes,
         "stacks": len(plan.stacks),
         "stacked_outputs": len(plan.stacks),
         "stack_inputs": frame_count,
@@ -4343,12 +4359,21 @@ def main():
     unrecognized_extensions: dict[str, int] = defaultdict(int)
     other_source_files: list[dict[str, Any]] = []
     scanned_source_subdirs: set[str] = set()
+    canon_frames_seen = 0
     try:
         for entry in iter_source_file_entries(
             src_dir, recursive=scan_recursively, exclude_dirs=scan_exclude_dirs
         ):
             stem, ext = os.path.splitext(entry.name)
             ext_lower = ext.lower()
+            if ext_lower == ".cr3":
+                # Counted regardless of which bucket the file lands in below
+                # (CR3 is itself a RAW_EXTENSIONS member, so it always takes
+                # the "raw" branch here) -- this scan already walks and
+                # classifies every file, so this is the same free-riding
+                # count --canon-import's own plan-json uses, just gathered
+                # from the lightroomimport side instead.
+                canon_frames_seen += 1
             if ext_lower in RAW_EXTENSIONS:
                 scanned_file_type = "raw"
             elif ext_lower in ORI_EXTENSIONS:
@@ -5642,6 +5667,7 @@ def main():
                 "others": planned_remaining_count,
                 "other_photos": planned_remaining_count - other_videos,
                 "other_videos": other_videos,
+                "canon_frames_detected": canon_frames_seen,
                 "newest_date": newest_text,
                 "dest_lightroom": dated_lightroom,
                 "dest_stack_input": dated_stack_input,

@@ -205,6 +205,66 @@ class PlanJsonTests(unittest.TestCase):
             self.assertFalse(json.loads(output)["source_would_be_empty_after"])
 
 
+class CanonFrameDetectionInLightroomPlanTests(unittest.TestCase):
+    """The GUI's Canon checkbox can only ever appear if this field exists.
+
+    ``detect_canon_mode`` (stackcopy_gui.py) reads ``canon_frames_detected``
+    from whatever plan the GUI's scan returns. Before this fix, a
+    --lightroomimport --plan-json scan never emitted that key at all, so a
+    Canon card's checkbox could never surface on a first-ever scan (the GUI
+    only ever runs --canon-import once the checkbox is already ticked). This
+    field must be present, and correct, on every --lightroomimport plan.
+    """
+
+    def test_reports_zero_when_the_card_has_no_cr3_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "card"
+            lightroom = root / "Lightroom"
+            stack_input = root / "StackInput"
+            write_file(source / "P8080001.ORF", b"raw", datetime(2026, 8, 25))
+            write_file(source / "P8080001.JPG", b"jpg", datetime(2026, 8, 25))
+
+            code, output = run_main(
+                ["--lightroomimport", str(source), "--plan-json"],
+                lightroom=lightroom,
+                stack_input=stack_input,
+                metadata={},
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output)["canon_frames_detected"], 0)
+
+    def test_counts_cr3_files_case_insensitively_and_recursively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "card"
+            lightroom = root / "Lightroom"
+            stack_input = root / "StackInput"
+            when = datetime(2026, 8, 25)
+            # An ordinary Olympus pair, unrelated to the CR3 count.
+            write_file(source / "P8080001.ORF", b"raw", when)
+            write_file(source / "P8080001.JPG", b"jpg", when)
+            # CR3s in a nested folder, mixed case, none paired with a stack.
+            write_file(source / "DCIM" / "100EOSR6" / "IMG_0001.CR3", b"a", when)
+            write_file(source / "DCIM" / "100EOSR6" / "IMG_0002.cr3", b"b", when)
+            write_file(source / "DCIM" / "100EOSR6" / "IMG_0003.Cr3", b"c", when)
+
+            code, output = run_main(
+                ["--lightroomimport", str(source), "--plan-json"],
+                lightroom=lightroom,
+                stack_input=stack_input,
+                metadata={},
+            )
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output)
+            self.assertEqual(payload["canon_frames_detected"], 3)
+            # The CR3s are still ordinary RAW files to --lightroomimport --
+            # this field is purely an additive count, not a reclassification.
+            self.assertEqual(payload["total"], 5)
+
+
 class ProgressRoleTests(unittest.TestCase):
     def test_real_import_progress_includes_roles_and_stack_output_name(self):
         with tempfile.TemporaryDirectory() as tmp:

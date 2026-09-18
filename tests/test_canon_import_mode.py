@@ -1390,6 +1390,71 @@ class CanonPlanJsonTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed["stacks"], 1)
 
+    def test_bytes_sums_the_real_source_file_sizes(self):
+        """The source strip must stop reading '0 bytes' on every Canon scan.
+
+        Mirrors how --lightroomimport's own plan-json ``bytes`` total is
+        computed: sum ``os.path.getsize()`` over every source file the plan
+        will actually copy (each stack's composite JPG and its frames, plus
+        every loose single) -- not a second, invented approach.
+        """
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            jpg_src = root / "IMG_0040.JPG"
+            frame_srcs = [root / f"IMG_{n:04d}.CR3" for n in (15, 16)]
+            single_src = root / "IMG_0067.CR3"
+            jpg_src.write_bytes(b"j" * 100)
+            frame_srcs[0].write_bytes(b"f" * 200)
+            frame_srcs[1].write_bytes(b"f" * 300)
+            single_src.write_bytes(b"s" * 50)
+
+            stack = stackcopy.CanonPlannedStack(
+                dest_dir=str(root / "dest" / "IMG_0040"),
+                jpg_src=str(jpg_src),
+                jpg_dest=str(root / "dest" / "IMG_0040" / "IMG_0040.JPG"),
+                frame_sources=tuple(str(p) for p in frame_srcs),
+            )
+            plan = stackcopy.CanonImportPlan(
+                stacks=(stack,),
+                singles=(str(root / "singles" / "IMG_0067.CR3"),),
+                single_sources=(str(single_src),),
+                unresolved=(),
+            )
+
+            payload = stackcopy.canon_plan_payload(
+                plan, dest_dir=str(root / "dest"),
+                singles_dir=str(root / "singles"),
+                canon_frames_detected=3,
+            )
+
+            self.assertEqual(payload["bytes"], 100 + 200 + 300 + 50)
+
+    def test_bytes_skips_a_source_file_that_has_vanished(self):
+        """A file gone between the scan and payload-building must not crash it."""
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            jpg_src = root / "IMG_0040.JPG"
+            jpg_src.write_bytes(b"j" * 40)
+            missing_frame = root / "IMG_0015.CR3"  # never created
+
+            stack = stackcopy.CanonPlannedStack(
+                dest_dir=str(root / "dest" / "IMG_0040"),
+                jpg_src=str(jpg_src),
+                jpg_dest=str(root / "dest" / "IMG_0040" / "IMG_0040.JPG"),
+                frame_sources=(str(missing_frame),),
+            )
+            plan = stackcopy.CanonImportPlan(
+                stacks=(stack,), singles=(), single_sources=(), unresolved=(),
+            )
+
+            payload = stackcopy.canon_plan_payload(
+                plan, dest_dir=str(root / "dest"),
+                singles_dir=str(root / "singles"),
+                canon_frames_detected=1,
+            )
+
+            self.assertEqual(payload["bytes"], 40)
+
     def test_plan_json_is_accepted_with_canon_import(self):
         parser = stackcopy.build_parser()
         args = parser.parse_args(

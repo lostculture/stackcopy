@@ -451,6 +451,26 @@ class PlanRowsComeFromTheHelperTests(unittest.TestCase):
         self.assertEqual(source.count("single shots and videos - names untouched"), 1)
 
 
+class CanonFieldIntTests(unittest.TestCase):
+    """``canon_field_int`` tolerates whatever a photographer types into the field.
+
+    Mirrors ``CanonMethodIndexTests`` in ``tests/test_gui_update_state.py``: valid
+    input passes through, everything else falls back to the caller's default
+    rather than raising ``ValueError``/``TypeError`` at the moment Import is
+    clicked.
+    """
+
+    def test_valid_numbers_pass_through_unchanged(self):
+        self.assertEqual(gui.canon_field_int("3", 99), 3)
+        self.assertEqual(gui.canon_field_int("0", 99), 0)
+        self.assertEqual(gui.canon_field_int(" 4 ", 99), 4)
+
+    def test_non_numeric_blank_whitespace_and_none_fall_back_to_the_default(self):
+        for bad in ("abc", "", "   ", None):
+            with self.subTest(bad=bad):
+                self.assertEqual(gui.canon_field_int(bad, 99), 99)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -572,8 +592,21 @@ class DetectCanonModeTests(unittest.TestCase):
         self.assertEqual(reason, "")
 
     def test_zero_cr3_reported_explicitly_does_not_tick(self):
-        ticked, _ = gui.detect_canon_mode({"canon_frames_detected": 0})
+        ticked, reason = gui.detect_canon_mode({"canon_frames_detected": 0})
         self.assertFalse(ticked)
+        self.assertEqual(reason, "")
+
+    def test_an_explicit_zero_count_degrades_exactly_like_a_missing_key(self):
+        """A --lightroomimport scan now always reports the field, even as 0.
+
+        ``detect_canon_mode`` must not distinguish "no CR3s, reported as 0"
+        from "no CR3s, field absent" (an older CLI, or --canon-import's own
+        payload before it ever computes a count) -- both mean "not Canon".
+        """
+        explicit_zero = gui.detect_canon_mode({"canon_frames_detected": 0})
+        missing_key = gui.detect_canon_mode({})
+        self.assertEqual(explicit_zero, missing_key)
+        self.assertEqual(explicit_zero, (False, ""))
 
 
 class CanonImportArgsTests(unittest.TestCase):
