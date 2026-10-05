@@ -1,5 +1,19 @@
 # Change Log
 
+## **Unreleased**
+
+- **Helicon renders now carry the photo's capture time and GPS.** Helicon
+  Focus writes its output with no EXIF at all, so a render sorted as if it had
+  been taken when it was rendered, and had no location. After each render,
+  `--canon-import --render-helicon` copies `DateTimeOriginal`, `CreateDate`,
+  their sub-second and time-zone tags, and all GPS tags from the camera's
+  composite JPG onto the render with ExifTool. A composite with no location is
+  not an error; the render gets its capture time alone. Renders already on disk
+  are filled in on a re-run. A copy that fails is reported as
+  `Metadata not copied` and makes the run exit non-zero, the same as a failed
+  render; without ExifTool the renders are kept and one notice says the
+  metadata was skipped.
+
 ## **1.8.0 - 2026-09-18**
 
 - **The GUI now handles Canon depth-composite cards.** A card with CR3 files is

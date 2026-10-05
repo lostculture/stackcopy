@@ -109,6 +109,56 @@ def render_command(
     ]
 
 
+# What a render inherits from the camera's composite. Helicon writes its output
+# with no EXIF at all, so without these a render sorts by the moment it was
+# rendered and has no location. Sub-second and offset tags are included because
+# they are what makes the capture time exact (and keep a burst in order).
+CAPTURE_METADATA_TAGS = (
+    "-DateTimeOriginal",
+    "-CreateDate",
+    "-SubSecTimeOriginal",
+    "-SubSecTimeDigitized",
+    "-OffsetTimeOriginal",
+    "-OffsetTimeDigitized",
+    "-OffsetTime",
+    "-GPS:all",
+)
+METADATA_TIMEOUT_SECONDS = 60
+
+
+def copy_capture_metadata(exiftool: str, source: str, output_path: str) -> str | None:
+    """Copy capture time and GPS from ``source`` onto a render.
+
+    Returns None on success, otherwise a one-line reason. Never raises: a
+    render without metadata is still a good render, so the caller decides
+    how loudly to report it. A source with no GPS is not an error -- many
+    shots have no location -- the render simply gets the capture time alone.
+    """
+    if not os.path.isfile(source):
+        return f"source {os.path.basename(source)} does not exist"
+    try:
+        completed = subprocess.run(
+            [
+                exiftool, "-q", "-q", "-overwrite_original",
+                "-tagsFromFile", source, *CAPTURE_METADATA_TAGS, output_path,
+            ],
+            check=False,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            encoding="utf-8",
+            errors="replace",
+            timeout=METADATA_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return f"ExifTool timed out after {METADATA_TIMEOUT_SECONDS}s"
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"ExifTool could not be run: {error}"
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        return detail[0] if detail else f"ExifTool exited {completed.returncode}"
+    return None
+
+
 def render_stack(
     helicon: str,
     frames: list[str],

@@ -27,6 +27,19 @@ FIXTURE = Path(__file__).parent / "fixtures" / "canon_108eosr6.json"
 TARGET_FOLDERS = {"108EOSR6"}
 
 
+@pytest.fixture(autouse=True)
+def no_real_metadata_copy(monkeypatch):
+    """Renders here are faked, so there is no real file for ExifTool to write.
+
+    conftest pins a placeholder ExifTool path; letting the metadata step run
+    it would turn every render test into an ExifTool test. Tests about the
+    metadata step replace this stub with their own.
+    """
+    monkeypatch.setattr(
+        helicon_focus, "copy_capture_metadata", lambda *a, **k: None
+    )
+
+
 def _one_stack_and_single_plan():
     """A plan with one 25-frame stack and one loose CR3.
 
@@ -1782,3 +1795,99 @@ def test_canon_plan_payload_reports_exiftool_like_every_other_plan(
 
     assert payload["exiftool_status"] == "missing"
     assert gui.exiftool_status_display(payload) is not None
+
+
+# --- Capture metadata copied onto Helicon renders ---------------------------
+
+
+def _render_run(tmp_path, monkeypatch, render_result, metadata_error=None):
+    """Run a one-stack --render-helicon import, recording metadata copies."""
+    plan, stack_dir = _one_stack_plan(tmp_path)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
+    )
+    monkeypatch.setattr(
+        stackcopy.helicon_focus, "render_stack",
+        lambda helicon, frames, output_path, **kwargs: render_result(output_path),
+    )
+    copies = []
+
+    def fake_copy(exiftool, source, output_path):
+        copies.append((exiftool, source, output_path))
+        return metadata_error
+
+    monkeypatch.setattr(stackcopy.helicon_focus, "copy_capture_metadata", fake_copy)
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(tmp_path / "src"), str(tmp_path / "dst"),
+         "--no-dng", "--render-helicon"]
+    )
+    exit_code = stackcopy.run_canon_import(args)
+    return exit_code, copies, stack_dir
+
+
+def test_a_new_render_gets_the_composites_capture_metadata(tmp_path, monkeypatch):
+    exit_code, copies, stack_dir = _render_run(
+        tmp_path, monkeypatch,
+        lambda out: helicon_focus.RenderResult(out, rendered=True),
+    )
+
+    assert exit_code == 0
+    assert copies == [(
+        "/usr/bin/exiftool",
+        str(stack_dir / "IMG_0001.JPG"),
+        str(stack_dir.parent / "IMG_0001 helicon.jpg"),
+    )]
+
+
+def test_an_existing_render_is_backfilled_with_capture_metadata(tmp_path, monkeypatch):
+    """Renders from an earlier run (before this feature) gain metadata on re-run."""
+    exit_code, copies, _ = _render_run(
+        tmp_path, monkeypatch,
+        lambda out: helicon_focus.RenderResult(out, skipped=True),
+    )
+
+    assert exit_code == 0
+    assert len(copies) == 1
+
+
+def test_a_failed_render_gets_no_metadata_copy(tmp_path, monkeypatch):
+    exit_code, copies, _ = _render_run(
+        tmp_path, monkeypatch,
+        lambda out: helicon_focus.RenderResult(out, error="stub render failed"),
+    )
+
+    assert exit_code == 1
+    assert copies == []
+
+
+def test_a_metadata_copy_failure_is_reported_and_counted(tmp_path, monkeypatch, capsys):
+    exit_code, _, _ = _render_run(
+        tmp_path, monkeypatch,
+        lambda out: helicon_focus.RenderResult(out, rendered=True),
+        metadata_error="stub exiftool failed",
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Metadata not copied" in output
+    assert "stub exiftool failed" in output
+
+
+def test_without_exiftool_renders_are_kept_and_the_gap_is_said_once(
+    tmp_path, monkeypatch, capsys
+):
+    """ExifTool is optional: its absence costs the metadata, never the render."""
+    stackcopy._exiftool_info = stackcopy.ExifToolInfo(
+        None, None, None, stackcopy.ExifToolSource.NONE
+    )
+    exit_code, copies, _ = _render_run(
+        tmp_path, monkeypatch,
+        lambda out: helicon_focus.RenderResult(out, rendered=True),
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert copies == []
+    assert output.count("capture time and GPS") == 1

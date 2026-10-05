@@ -510,6 +510,14 @@ its folder, without opening Helicon Focus by hand:
     --render-helicon --verbose
 ```
 
+Helicon writes its render with no EXIF metadata at all, so each render is then
+given the capture time (including sub-seconds and time zone) and GPS location
+of the camera's own composite JPG, using ExifTool. A composite with no location
+simply gives the render its capture time alone. Renders already on disk from an
+earlier run get the same treatment, so re-running the import backfills them.
+Without ExifTool the renders are still written, minus that metadata, and
+Stackcopy says so once.
+
 ### Debug stack detection
 
 If stacks aren't being detected correctly:
@@ -560,7 +568,7 @@ These only apply with `--canon-import` and error out if used with any other mode
 - `--singles-dir DIR` - Where loose CR3s that belong to no stack are copied (default: a `Single Images` folder beside `DEST_DIR`)
 - `--dng-jobs N` - Convert N stacks' worth of frames to DNG in parallel (default: 1, maximum: 32)
 - `--no-dng` - Copy CR3 frames as-is instead of converting them to DNG; skips Adobe DNG Converter discovery and the preflight check entirely
-- `--render-helicon` - After importing, render each stack with Helicon Focus to `<stack> helicon.jpg` beside its folder
+- `--render-helicon` - After importing, render each stack with Helicon Focus to `<stack> helicon.jpg` beside its folder, carrying the composite's capture time and GPS
 - `--helicon-method {0,1,2}` - Helicon rendering method A/B/C (default: `2`, method C)
 - `--helicon-radius N` - Helicon Focus radius (default: `8`, Helicon's own default)
 - `--helicon-smoothing N` - Helicon Focus smoothing (default: `4`, Helicon's own default)

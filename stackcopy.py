@@ -3608,6 +3608,7 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
     # No dry-run guard here: --dry already returned above, so one would be
     # dead code.
     render_failures = 0
+    metadata_failures = 0
     if args.render_helicon:
         helicon = helicon_focus.find_helicon()
         if helicon is None:
@@ -3616,6 +3617,17 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
                 f"{helicon_focus.HELICON_ENV}."
             )
             return 1
+
+        # Helicon's output carries no EXIF; the composite's capture time and
+        # GPS are copied onto it. ExifTool stays optional here as everywhere
+        # else: without it the renders are still written, minus metadata.
+        info = exiftool_info()
+        exiftool = info.executable if info.available else None
+        if exiftool is None:
+            print(
+                "ExifTool is not available, so renders will not get the "
+                "camera's capture time and GPS."
+            )
 
         def _note_render_progress(name: str) -> None:
             nonlocal done
@@ -3702,15 +3714,32 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
             if not result.ok:
                 render_failures += 1
                 print(f"  Helicon failed: {display_path(output)}: {result.error}")
-            elif args.verbose and result.rendered:
+                continue
+            if args.verbose and result.rendered:
                 print(f"  Rendered {display_path(output)}")
+            # Also for a render skipped as already present: copying is
+            # idempotent, and it backfills renders made before this existed.
+            if exiftool is not None:
+                metadata_error = helicon_focus.copy_capture_metadata(
+                    exiftool, stack.jpg_dest, output
+                )
+                if metadata_error is not None:
+                    metadata_failures += 1
+                    print(
+                        f"  Metadata not copied: {display_path(output)}: "
+                        f"{metadata_error}"
+                    )
 
     # A terminal phase, exactly as --lightroomimport emits one. The GUI's
     # progress bar only ever reaches 100% on this line; without it a
     # finished Canon import leaves the bar wherever the last file put it.
     _emit_progress(phase="done", done=done, total=operation_total)
 
-    return 1 if (stack_failures or failed_singles or render_failures) else 0
+    return (
+        1
+        if (stack_failures or failed_singles or render_failures or metadata_failures)
+        else 0
+    )
 
 
 # Conversion is CPU-bound and one process per folder; beyond a few dozen

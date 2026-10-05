@@ -5,6 +5,8 @@ import tempfile
 from pathlib import Path
 
 
+import pytest
+
 import helicon_focus
 
 
@@ -165,3 +167,103 @@ def test_render_writes_its_frame_list_outside_the_destination(
         "the frame list was written into the destination folder"
     )
     assert not Path(seen["path"]).exists(), "and it must still be cleaned up"
+
+
+# --- Capture metadata on renders -------------------------------------------
+#
+# Helicon writes its render with no EXIF at all, so a render sorts as "taken
+# whenever it was rendered" and has no location. copy_capture_metadata copies
+# the capture time and GPS from the camera's own composite JPG. These tests use
+# the real ExifTool because what matters is what lands in the file, not which
+# arguments were passed.
+
+import shutil
+import subprocess
+
+# A valid 1x1 baseline JPEG: the smallest real file ExifTool will write into.
+TINY_JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffdb004300080606070605080707"
+    "070909080a0c140d0c0b0b0c1912130f141d1a1f1e1d1a1c1c20242e2720222c231c"
+    "1c2837292c30313434341f27393d38323c2e333432ffc0000b080001000101011100"
+    "ffc4001f0000010501010101010100000000000000000102030405060708090a0bff"
+    "c400b5100002010303020403050504040000017d0102030004110512213141061351"
+    "6107227114328191a1082342b1c11552d1f02433627282090a161718191a25262728"
+    "292a3435363738393a434445464748494a535455565758595a636465666768696a73"
+    "7475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2"
+    "b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8"
+    "e9eaf1f2f3f4f5f6f7f8f9faffda0008010100003f00fbd3ffd9"
+)
+
+EXIFTOOL = shutil.which("exiftool")
+needs_exiftool = pytest.mark.skipif(EXIFTOOL is None, reason="ExifTool not installed")
+
+
+def _jpeg(path: Path, *tags: str) -> Path:
+    path.write_bytes(TINY_JPEG)
+    if tags:
+        subprocess.run(
+            [EXIFTOOL, "-q", "-overwrite_original", *tags, str(path)], check=True
+        )
+    return path
+
+
+def _read(path: Path, *tags: str) -> list[str]:
+    completed = subprocess.run(
+        [EXIFTOOL, "-s3", "-f", *tags, str(path)],
+        check=True, capture_output=True, encoding="utf-8",
+    )
+    return completed.stdout.splitlines()
+
+
+@needs_exiftool
+def test_capture_time_and_gps_are_copied_onto_the_render(tmp_path):
+    source = _jpeg(
+        tmp_path / "IMG_0014.JPG",
+        "-DateTimeOriginal=2026:10:03 15:43:42",
+        "-SubSecTimeOriginal=78",
+        "-OffsetTimeOriginal=-04:00",
+        "-GPSLatitude=41.380511", "-GPSLatitudeRef=N",
+        "-GPSLongitude=78.277358", "-GPSLongitudeRef=W",
+    )
+    render = _jpeg(tmp_path / "IMG_0014 helicon.jpg")
+
+    error = helicon_focus.copy_capture_metadata(EXIFTOOL, str(source), str(render))
+
+    assert error is None
+    assert _read(render, "-SubSecDateTimeOriginal", "-GPSPosition", "-n") == _read(
+        source, "-SubSecDateTimeOriginal", "-GPSPosition", "-n"
+    )
+    assert not list(tmp_path.glob("*_original")), "no ExifTool backup files left behind"
+
+
+@needs_exiftool
+def test_a_source_without_gps_still_gives_the_render_its_capture_time(tmp_path):
+    source = _jpeg(tmp_path / "IMG_0014.JPG", "-DateTimeOriginal=2026:10:03 15:43:42")
+    render = _jpeg(tmp_path / "IMG_0014 helicon.jpg")
+
+    error = helicon_focus.copy_capture_metadata(EXIFTOOL, str(source), str(render))
+
+    assert error is None
+    assert _read(render, "-DateTimeOriginal", "-GPSPosition") == ["2026:10:03 15:43:42", "-"]
+
+
+@needs_exiftool
+def test_a_missing_source_is_reported_not_raised(tmp_path):
+    render = _jpeg(tmp_path / "IMG_0014 helicon.jpg")
+
+    error = helicon_focus.copy_capture_metadata(
+        EXIFTOOL, str(tmp_path / "missing.JPG"), str(render)
+    )
+
+    assert error is not None
+
+
+def test_an_unrunnable_exiftool_is_reported_not_raised(tmp_path):
+    render = tmp_path / "out.jpg"
+    render.write_bytes(TINY_JPEG)
+
+    error = helicon_focus.copy_capture_metadata(
+        str(tmp_path / "no-such-exiftool"), str(tmp_path / "src.JPG"), str(render)
+    )
+
+    assert error is not None
