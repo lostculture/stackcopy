@@ -732,8 +732,10 @@ reported and skipped, and every other stack still proceeds.
 
 **Helicon Focus**, needed only with `--render-helicon`, renders each stack
 into a finished `.jpg`. Stackcopy looks for it via the `STACKCOPY_HELICON`
-environment variable, then the standard install location for your platform;
-there is no `PATH` fallback. Rendering uses Helicon's default method C
+environment variable, then the standard install location for your platform,
+then a `HeliconFocus` executable on `PATH`. If `STACKCOPY_HELICON` is set but
+does not point at a file, Stackcopy stops there rather than falling back to
+another copy. Rendering uses Helicon's default method C
 (`--helicon-method 2`; pass `0` or `1` for methods A or B), and Helicon's own
 radius and smoothing defaults (`--helicon-radius 8`, `--helicon-smoothing 4`)
 unless overridden. Stackcopy hands Helicon an explicit list of frame files
