@@ -18,6 +18,7 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -194,6 +195,90 @@ def _expected_dng(dest_dir: str, source: str) -> str:
     return os.path.join(dest_dir, f"{stem}.dng")
 
 
+_TIFF_MAGICS = (b"II*\x00", b"MM\x00*")
+_TIFF_OFFSET_TAGS = {273: 279, 324: 325}  # StripOffsets, TileOffsets -> byte counts
+_TIFF_SUBIFDS_TAG = 330
+_TIFF_VALUE_SIZES = {3: 2, 4: 4, 13: 4}  # SHORT, LONG, IFD
+_MAX_IFDS = 64
+
+
+def dng_is_complete(path: str) -> bool:
+    """False when ``path`` is empty or a TIFF/DNG cut off before its end.
+
+    The converter can crash partway through a frame and still exit 0, so
+    a file existing proves nothing.  Adobe writes the directories at the
+    front and the raw image data out to the last byte, which is why a
+    truncated DNG still has a header that parses: what gives it away is
+    a directory, strip or tile that would end past EOF.  Every IFD
+    reachable through the next-IFD chain and SubIFDs is checked.
+
+    This detects truncation; it does not validate the format.  Content
+    that does not start with a TIFF header is not judged at all.  Only the
+    directories are read, never the image data, so checking every frame of
+    a resumed import stays cheap.
+    """
+    try:
+        size = os.path.getsize(path)
+        if size == 0:
+            return False
+        with open(path, "rb") as handle:
+            return _tiff_within_bounds(handle, size)
+    except (OSError, struct.error):
+        return False
+
+
+def _tiff_within_bounds(handle, size: int) -> bool:
+    header = handle.read(8)
+    if not any(m.startswith(header[:4]) for m in _TIFF_MAGICS):
+        return True
+    if len(header) < 8 or header[:4] not in _TIFF_MAGICS:
+        return False
+    order = "<" if header[:2] == b"II" else ">"
+
+    def read(offset: int, length: int) -> bytes:
+        if offset + length > size:
+            raise struct.error("past end of file")
+        handle.seek(offset)
+        return handle.read(length)
+
+    def values(entry: bytes) -> list[int]:
+        _tag, typ, count = struct.unpack(order + "HHI", entry[:8])
+        width = _TIFF_VALUE_SIZES[typ]
+        raw = entry[8:12] if width * count <= 4 else read(
+            struct.unpack(order + "I", entry[8:12])[0], width * count
+        )
+        fmt = "H" if width == 2 else "I"
+        return list(struct.unpack(f"{order}{count}{fmt}", raw[: width * count]))
+
+    pending = [struct.unpack(order + "I", header[4:8])[0]]
+    seen: set[int] = set()
+    while pending:
+        offset = pending.pop()
+        if offset == 0 or offset in seen:
+            continue
+        if len(seen) >= _MAX_IFDS:
+            return False
+        seen.add(offset)
+        count = struct.unpack(order + "H", read(offset, 2))[0]
+        block = read(offset + 2, count * 12 + 4)
+        entries = {}
+        for i in range(count):
+            entry = block[i * 12 : i * 12 + 12]
+            tag, typ = struct.unpack(order + "HH", entry[:4])
+            if typ in _TIFF_VALUE_SIZES:
+                entries[tag] = entry
+        for offsets_tag, counts_tag in _TIFF_OFFSET_TAGS.items():
+            if offsets_tag in entries and counts_tag in entries:
+                starts = values(entries[offsets_tag])
+                lengths = values(entries[counts_tag])
+                if any(s + n > size for s, n in zip(starts, lengths)):
+                    return False
+        if _TIFF_SUBIFDS_TAG in entries:
+            pending.extend(values(entries[_TIFF_SUBIFDS_TAG]))
+        pending.append(struct.unpack(order + "I", block[-4:])[0])
+    return True
+
+
 _ERROR_TAIL_LIMIT = 400
 
 
@@ -287,7 +372,7 @@ def _convert_group(
     """
     os.makedirs(dest_dir, exist_ok=True)
     _clear_stale_staging(dest_dir)
-    pending = [f for f in files if not os.path.exists(_expected_dng(dest_dir, f))]
+    pending = [f for f in files if not dng_is_complete(_expected_dng(dest_dir, f))]
     skipped = len(files) - len(pending)
     if not pending:
         return ConversionResult(dest_dir, converted=0, skipped=skipped)
@@ -320,6 +405,9 @@ def _convert_group(
             )
 
         produced = [f for f in pending if os.path.exists(_expected_dng(staging, f))]
+        truncated = [
+            f for f in produced if not dng_is_complete(_expected_dng(staging, f))
+        ]
         tail = _tail(completed.stderr) or _tail(completed.stdout)
 
         # Exit status and files on disk must agree, exactly as preflight()
@@ -343,10 +431,30 @@ def _convert_group(
                 ),
             )
 
-        for source in produced:
+        # Exit 0 is not enough either: the converter has been seen to crash
+        # partway through a frame and still exit 0, leaving a truncated
+        # DNG that would otherwise be published and then skipped by every
+        # resume.  Only complete files reach the real path.
+        published = [f for f in produced if f not in set(truncated)]
+        for source in published:
             os.replace(_expected_dng(staging, source), _expected_dng(dest_dir, source))
 
-        missing = [f for f in pending if f not in set(produced)]
+        missing = [f for f in pending if f not in set(published)]
+        if truncated:
+            return ConversionResult(
+                dest_dir,
+                converted=len(published),
+                skipped=skipped,
+                failed=len(missing),
+                error=(
+                    f"converter exited {completed.returncode} but left a "
+                    f"truncated DNG for {_names_of(truncated)}, so it was "
+                    "discarded; rerun to convert it again."
+                    + (f" No DNG at all for {_names_of([f for f in missing if f not in truncated])}."
+                       if len(missing) > len(truncated) else "")
+                    + tail
+                ),
+            )
         if missing:
             return ConversionResult(
                 dest_dir,

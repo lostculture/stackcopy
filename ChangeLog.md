@@ -2,6 +2,17 @@
 
 ## **Unreleased**
 
+- **A truncated DNG is no longer published or skipped as finished.** Adobe DNG
+  Converter can crash partway through a frame and still exit 0. The half-written
+  DNG it left was published like any other, and every later run then skipped it
+  as already converted, so Helicon failed that stack on every retry. On one real
+  56-stack import this happened to six frames, one of them 1 MB of an expected
+  25 MB. A converted frame is now checked before it is published: if any image
+  data it declares would end past the end of the file, it is discarded and
+  reported, and a rerun converts it again. Frames already on disk are checked the
+  same way on resume, so ones truncated by an earlier version are redone too. The
+  check reads only the file's directories, never its image data.
+
 - **Helicon renders now carry the photo's capture time and GPS.** Helicon
   Focus writes its output with no EXIF at all, so a render sorted as if it had
   been taken when it was rendered, and had no location. After each render,

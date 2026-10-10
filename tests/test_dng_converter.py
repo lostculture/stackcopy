@@ -372,3 +372,117 @@ def test_convert_group_reports_timeout_as_failure(tmp_path):
     assert result.failed == 1
     assert result.error is not None
     assert "timed out" in result.error
+
+
+def _tiff_bytes(image_size: int = 64) -> bytes:
+    """A minimal little-endian TIFF: one IFD whose one strip ends at EOF.
+
+    That is the shape Adobe DNG Converter writes - directories at the
+    front, raw image data running to the last byte - so cutting bytes off
+    the end leaves a header that still parses but points past EOF.
+    """
+    import struct
+
+    entries = [
+        (273, 4, 1, 38),          # StripOffsets: data right after the IFD
+        (279, 4, 1, image_size),  # StripByteCounts
+    ]
+    ifd = struct.pack("<H", len(entries))
+    for tag, typ, count, value in entries:
+        ifd += struct.pack("<HHII", tag, typ, count, value)
+    ifd += struct.pack("<I", 0)
+    return b"II*\x00" + struct.pack("<I", 8) + ifd + b"\x00" * image_size
+
+
+def _copying_stub(tmp_path, template: Path, name="copying_stub"):
+    """A converter that 'converts' each frame by copying template into place.
+
+    Exits 0 regardless - the real converter did exactly that on 2026-10-09,
+    crashing partway through a frame and still reporting success.
+    """
+    script = tmp_path / f"{name}.py"
+    script.write_text(
+        "import os, shutil, sys\n"
+        "dest = sys.argv[4]\n"
+        "for f in sys.argv[5:]:\n"
+        "    stem = os.path.splitext(os.path.basename(f))[0]\n"
+        f"    shutil.copyfile({str(template)!r}, os.path.join(dest, stem + '.dng'))\n",
+        encoding="utf-8",
+    )
+    args = '%*' if sys.platform == "win32" else '"$@"'
+    return make_stub(tmp_path, f'"{sys.executable}" "{script}" {args}', name)
+
+
+def test_dng_is_complete_accepts_a_whole_file(tmp_path):
+    path = tmp_path / "whole.dng"
+    path.write_bytes(_tiff_bytes())
+    assert dng_converter.dng_is_complete(str(path))
+
+
+def test_dng_is_complete_rejects_a_file_cut_off_mid_image(tmp_path):
+    path = tmp_path / "cut.dng"
+    path.write_bytes(_tiff_bytes()[:-10])
+    assert not dng_converter.dng_is_complete(str(path))
+
+
+def test_dng_is_complete_rejects_a_file_cut_off_inside_its_header(tmp_path):
+    path = tmp_path / "stub.dng"
+    path.write_bytes(_tiff_bytes()[:12])
+    assert not dng_converter.dng_is_complete(str(path))
+
+
+def test_dng_is_complete_rejects_an_empty_file(tmp_path):
+    path = tmp_path / "empty.dng"
+    path.write_bytes(b"")
+    assert not dng_converter.dng_is_complete(str(path))
+
+
+def test_a_truncated_dng_from_an_exit_zero_converter_is_not_published(tmp_path):
+    """The converter can crash mid-frame and still exit 0.
+
+    On a real 56-stack import, six frames were published truncated this way
+    (one at 1 MB of 25 MB), and Helicon then failed those stacks on every
+    retry because resume skipped them as already converted.
+    """
+    template = tmp_path / "truncated.dng"
+    template.write_bytes(_tiff_bytes()[:-10])
+    src = tmp_path / "src"
+    src.mkdir()
+    f = src / "IMG_0001.CR3"
+    f.write_bytes(b"raw")
+    dest = tmp_path / "out"
+
+    result = dng_converter.convert_group(
+        _copying_stub(tmp_path, template), [str(f)], str(dest)
+    )
+
+    assert not result.ok
+    assert result.failed == 1
+    assert "IMG_0001" in result.error
+    assert not (dest / "IMG_0001.dng").exists()
+
+
+def test_resume_reconverts_a_truncated_dng_already_in_place(tmp_path):
+    """Files truncated by an older run are redone, not skipped."""
+    template = tmp_path / "whole.dng"
+    template.write_bytes(_tiff_bytes())
+    src = tmp_path / "src"
+    src.mkdir()
+    dest = tmp_path / "out"
+    dest.mkdir()
+    files = []
+    for n in (1, 2):
+        f = src / f"IMG_{n:04d}.CR3"
+        f.write_bytes(b"raw")
+        files.append(str(f))
+    (dest / "IMG_0001.dng").write_bytes(_tiff_bytes())
+    (dest / "IMG_0002.dng").write_bytes(_tiff_bytes()[:-10])
+
+    result = dng_converter.convert_group(
+        _copying_stub(tmp_path, template), files, str(dest)
+    )
+
+    assert result.ok
+    assert result.skipped == 1
+    assert result.converted == 1
+    assert dng_converter.dng_is_complete(str(dest / "IMG_0002.dng"))
