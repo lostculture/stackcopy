@@ -2,6 +2,14 @@
 
 ## **Unreleased**
 
+- **A Helicon error dialog no longer stalls a render for its whole timeout.**
+  When Helicon Focus fails a render it opens a modal "Rendering failed" dialog,
+  even under `-silent -noprogress`, and then waits for a click that never comes.
+  Each such failure cost the full render timeout - 25 minutes for a 25-frame
+  stack. Helicon is now watched while it runs (Windows): if that dialog appears,
+  Helicon is stopped and the render reported as failed straight away, with the
+  dialog named in the message. The timeout remains as the backstop elsewhere.
+
 - **A truncated DNG is no longer published or skipped as finished.** Adobe DNG
   Converter can crash partway through a frame and still exit 0. The half-written
   DNG it left was published like any other, and every later run then skipped it

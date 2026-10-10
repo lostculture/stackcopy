@@ -2,6 +2,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -267,3 +268,55 @@ def test_an_unrunnable_exiftool_is_reported_not_raised(tmp_path):
     )
 
     assert error is not None
+
+
+def _hanging_stub(tmp_path):
+    """A Helicon that never finishes, as one stuck on a modal dialog does."""
+    return make_stub(
+        tmp_path, f'"{sys.executable}" -c "import time; time.sleep(60)"', "hung"
+    )
+
+
+def test_a_rendering_failed_dialog_ends_the_render_at_once(tmp_path):
+    """Helicon reports a failed render with a modal dialog, even in -silent.
+
+    It then waits for a click that never comes, so each such failure used
+    to cost the whole render timeout (25 minutes for a 25-frame stack).
+    """
+    frame = tmp_path / "IMG_0001.dng"
+    frame.write_bytes(b"d")
+    out = tmp_path / "IMG_0002 helicon.jpg"
+    seen_pids = []
+
+    def probe(pid):
+        seen_pids.append(pid)
+        return "Rendering failed"
+
+    started = time.monotonic()
+    result = helicon_focus.render_stack(
+        _hanging_stub(tmp_path), [str(frame)], str(out),
+        timeout=50, dialog_probe=probe,
+    )
+
+    assert time.monotonic() - started < 20
+    assert not result.ok
+    assert "Rendering failed" in result.error
+    assert seen_pids and all(isinstance(p, int) for p in seen_pids)
+
+
+def test_no_dialog_lets_the_render_run_to_completion(tmp_path):
+    frame = tmp_path / "IMG_0001.dng"
+    frame.write_bytes(b"d")
+    out = tmp_path / "IMG_0002 helicon.jpg"
+    stub = make_stub(tmp_path, f'echo img > "{out}"')
+
+    result = helicon_focus.render_stack(
+        stub, [str(frame)], str(out), dialog_probe=lambda pid: None
+    )
+
+    assert result.ok
+    assert result.rendered
+
+
+def test_the_default_dialog_probe_finds_nothing_for_a_windowless_process():
+    assert helicon_focus.find_error_dialog(os.getpid()) is None

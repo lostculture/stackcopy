@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 
 HELICON_ENV = "STACKCOPY_HELICON"
@@ -159,6 +160,66 @@ def copy_capture_metadata(exiftool: str, source: str, output_path: str) -> str |
     return None
 
 
+# Helicon reports a failed render with a modal dialog even under -silent
+# -noprogress, then waits for a click that never comes.  These are the
+# titles it is known to use.
+ERROR_DIALOG_TITLES = ("Rendering failed",)
+DIALOG_POLL_SECONDS = 1.0
+
+
+def find_error_dialog(pid: int) -> str | None:
+    """Title of a known Helicon error dialog owned by ``pid``, else None.
+
+    Windows only; elsewhere, and on any failure to enumerate windows, it
+    reports nothing, which leaves the render timeout as the backstop.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        found: list[str] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def visit(hwnd, _lparam):
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == pid and user32.IsWindowVisible(hwnd):
+                buffer = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(hwnd, buffer, len(buffer))
+                if buffer.value in ERROR_DIALOG_TITLES:
+                    found.append(buffer.value)
+                    return False
+            return True
+
+        user32.EnumWindows(visit, 0)
+        return found[0] if found else None
+    except Exception:
+        return None
+
+
+def _wait_watching_for_dialog(process, timeout: float, dialog_probe) -> str | None:
+    """Wait for ``process``; return a dialog title if one ended the wait.
+
+    Raises subprocess.TimeoutExpired, as subprocess.run does, when neither
+    an exit nor a dialog arrives in time.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            process.wait(timeout=max(0.0, min(DIALOG_POLL_SECONDS, deadline - time.monotonic())))
+            return None
+        except subprocess.TimeoutExpired:
+            pass
+        title = dialog_probe(process.pid)
+        if title:
+            return title
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+
+
 def render_stack(
     helicon: str,
     frames: list[str],
@@ -168,6 +229,7 @@ def render_stack(
     smoothing: int = DEFAULT_SMOOTHING,
     jpeg_quality: int = DEFAULT_JPEG_QUALITY,
     timeout: float | None = None,
+    dialog_probe=find_error_dialog,
 ) -> RenderResult:
     """Render one stack.  An existing output is left alone so runs resume.
 
@@ -177,6 +239,11 @@ def render_stack(
     region below, so an OSError anywhere in it (a full disk, a permissions
     error, a path that collides with an existing file) becomes a failed
     RenderResult rather than an exception a caller has to know to catch.
+
+    Helicon is watched while it runs: if it puts up one of its error
+    dialogs, which it does even in silent mode and then waits on forever,
+    it is ended there and the failure reported immediately instead of
+    after the full timeout.
     """
     if os.path.exists(output_path):
         return RenderResult(output_path, rendered=False, skipped=True)
@@ -191,18 +258,29 @@ def render_stack(
         directory = os.path.dirname(output_path) or "."
         os.makedirs(directory, exist_ok=True)
         listing = write_file_list(frames)
-        completed = subprocess.run(
+        process = subprocess.Popen(
             render_command(
                 helicon, listing, output_path,
                 method, radius, smoothing, jpeg_quality,
             ),
-            check=False,
-            capture_output=True,
             stdin=subprocess.DEVNULL,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
+        try:
+            dialog = _wait_watching_for_dialog(process, timeout, dialog_probe)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        if dialog:
+            return RenderResult(
+                output_path,
+                error=(
+                    f"Helicon showed a \"{dialog}\" dialog and was stopped; "
+                    "a frame it could not read is the usual cause"
+                ),
+            )
     except subprocess.TimeoutExpired:
         return RenderResult(
             output_path, error=f"Helicon timed out after {timeout:.0f}s"
@@ -222,11 +300,11 @@ def render_stack(
         return RenderResult(
             output_path,
             error=(
-                f"Helicon exited {completed.returncode} without writing "
+                f"Helicon exited {process.returncode} without writing "
                 f"{os.path.basename(output_path)}"
             ),
         )
-    if completed.returncode != 0:
+    if process.returncode != 0:
         # A file landed on disk, but Helicon still reported failure -- the
         # output may be a partial or truncated render. Success requires
         # both signals to agree (mirrors dng_converter's _convert_group),
@@ -235,7 +313,7 @@ def render_stack(
         return RenderResult(
             output_path,
             error=(
-                f"Helicon exited {completed.returncode} after writing "
+                f"Helicon exited {process.returncode} after writing "
                 f"{os.path.basename(output_path)}; the output may be "
                 "incomplete or corrupt even though a file was produced"
             ),
