@@ -367,7 +367,7 @@ def test_no_dng_skips_the_converter_entirely(tmp_path, monkeypatch):
             "100EOSR6", 2, ".jpg", "IMG_0002.JPG", depth_composite=True
         ),
     ]
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: records)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: records)
 
     called = []
     monkeypatch.setattr(
@@ -401,7 +401,7 @@ def test_without_no_dng_the_same_stack_does_reach_converter_discovery(
             "100EOSR6", 2, ".jpg", "IMG_0002.JPG", depth_composite=True
         ),
     ]
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: records)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: records)
 
     called = []
     monkeypatch.setattr(
@@ -442,7 +442,7 @@ def test_import_refuses_when_converter_cannot_read_the_camera(
             "100EOSR6", 2, ".jpg", "IMG_0002.JPG", depth_composite=True
         ),
     ]
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: records)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: records)
     monkeypatch.setattr(
         stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
     )
@@ -568,7 +568,7 @@ def test_no_dng_execution_copies_composite_frame_and_single(tmp_path, monkeypatc
         ),
         canon_stacks.CanonFrame("100EOSR6", 3, ".cr3", "IMG_0003.CR3"),
     ]
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: records)
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: records)
 
     called = []
     monkeypatch.setattr(
@@ -795,7 +795,7 @@ def test_render_helicon_missing_binary_fails_clearly(tmp_path, monkeypatch, caps
     turning into a no-op. Exit code and message must both say so.
     """
     plan, stack_dir = _one_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(stackcopy.helicon_focus, "find_helicon", lambda: None)
 
@@ -828,7 +828,7 @@ def test_render_helicon_not_invoked_under_dry_run(tmp_path, monkeypatch):
     fail; a decorative second check inside the render block would not.
     """
     plan, stack_dir = _one_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
 
     def _must_not_be_called():
@@ -857,7 +857,7 @@ def test_render_helicon_failure_on_one_stack_does_not_abort_the_run(
     not evidence anything is wrong with stack two.
     """
     plan, stack_dirs = _two_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
@@ -893,7 +893,7 @@ def test_render_helicon_failure_on_one_stack_does_not_abort_the_run(
 def test_render_helicon_uses_raw_frames_when_no_dng(tmp_path, monkeypatch):
     """--no-dng: Helicon must render from the copied raw frames, not DNGs."""
     plan, stack_dir = _one_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
@@ -932,7 +932,7 @@ def test_render_helicon_uses_dng_frames_in_capture_order(tmp_path, monkeypatch):
     ONE-frame stack and so could not tell the two orders apart at all.
     """
     plan, stack_dir = _rollover_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
@@ -982,7 +982,7 @@ def test_render_helicon_skips_a_stack_with_a_missing_dng(
     focus sweep.
     """
     plan, stack_dir = _rollover_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
@@ -1029,7 +1029,7 @@ def test_render_helicon_ignores_a_stale_dng_left_by_an_earlier_run(
     from the plan cannot see it.
     """
     plan, stack_dir = _rollover_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
@@ -1089,7 +1089,7 @@ def test_render_helicon_skips_a_stack_whose_copy_already_failed(
     that never happened -- confusing noise, not new information.
     """
     plan, stack_dirs = _two_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
@@ -1145,7 +1145,7 @@ def test_no_dng_frame_copies_are_reported_and_reach_full_progress(
     resulting done == total at the end of a --no-dng run with real frames.
     """
     plan, stack_dir = _one_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
 
     args = stackcopy.parse_arguments(
@@ -1179,7 +1179,7 @@ def test_convert_phase_is_reported_and_reaches_full_progress(tmp_path, monkeypat
     either -- this test's fake convert_groups deliberately does.
     """
     plan, stack_dir = _one_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
@@ -1225,7 +1225,7 @@ def test_render_phase_is_reported_and_reaches_full_progress(tmp_path, monkeypatc
     done == total only once rendering is actually done.
     """
     plan, stack_dir = _one_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
@@ -1267,7 +1267,7 @@ def test_canon_import_runs_the_shared_low_space_check(tmp_path, monkeypatch):
     when conversion is on), so the estimate lands on the right filesystem.
     """
     plan, stack_dir = _rollover_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.dng_converter, "find_dng_converter", lambda: "/fake/converter"
@@ -1516,7 +1516,7 @@ class CanonPlanJsonStdoutRoutingTests(unittest.TestCase):
             exit_code = None
             with (
                 mock.patch.object(
-                    stackcopy, "read_canon_stack_metadata", lambda paths: records
+                    stackcopy, "read_canon_stack_metadata", lambda paths, *_: records
                 ),
                 mock.patch.object(
                     sys,
@@ -1604,7 +1604,7 @@ def _run_canon_import_capturing_progress():
              mock.patch.object(stackcopy.sys, "stderr", captured), \
              mock.patch.object(
                  stackcopy, "read_canon_stack_metadata",
-                 lambda paths: canon_stacks.records_from_exiftool_json(
+                 lambda paths, *_: canon_stacks.records_from_exiftool_json(
                      [{"SourceFile": p,
                        "SubSecDateTimeOriginal": "2026:07:31 10:44:02.03-04:00",
                        "FocusBracketingDepthComposite": 1} for p in paths]
@@ -1686,7 +1686,7 @@ def test_a_one_frame_stack_is_never_handed_to_helicon(
     increments, or the GUI's bar stalls short forever).
     """
     plan, stack_dir = _one_frame_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
@@ -1732,7 +1732,7 @@ def test_canon_progress_drives_the_guis_real_counters(tmp_path, monkeypatch):
     no test ever fed one's output to the other.
     """
     plan, _stack_dir = _one_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
 
     args = stackcopy.parse_arguments(
@@ -1803,7 +1803,7 @@ def test_canon_plan_payload_reports_exiftool_like_every_other_plan(
 def _render_run(tmp_path, monkeypatch, render_result, metadata_error=None):
     """Run a one-stack --render-helicon import, recording metadata copies."""
     plan, stack_dir = _one_stack_plan(tmp_path)
-    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths: [])
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", lambda paths, *_: [])
     monkeypatch.setattr(stackcopy, "build_canon_import_plan", lambda *a, **k: plan)
     monkeypatch.setattr(
         stackcopy.helicon_focus, "find_helicon", lambda: "/fake/helicon"
@@ -1891,3 +1891,47 @@ def test_without_exiftool_renders_are_kept_and_the_gap_is_said_once(
     assert exit_code == 0
     assert copies == []
     assert output.count("capture time and GPS") == 1
+
+
+def test_renamed_folder_with_name_filter_plans_only_that_series(
+    tmp_path, monkeypatch, capsys
+):
+    """A Lightroom-renamed folder (no camera subfolders) is imported directly,
+    and --name-filter keeps other series in the same folder out entirely."""
+    source = tmp_path / "20260712"
+    (source / "Stacked").mkdir(parents=True)
+    names = [f"Laurel Hill State Park {n:04d}.CR3" for n in (1, 2)]
+    names += ["Laurel Hill State Park 0003.JPG", "Croatia 0001.CR3",
+              "Croatia 0002.JPG", "Laurel Hill State Park 0001.XMP"]
+    for name in names:
+        (source / name).write_bytes(b"x")
+    (source / "Stacked" / "Laurel Hill State Park 0009.JPG").write_bytes(b"x")
+
+    seen = {}
+
+    def fake_metadata(paths, renamed_folders=frozenset()):
+        seen["paths"] = sorted(os.path.basename(p) for p in paths)
+        seen["renamed"] = renamed_folders
+        return canon_stacks.records_from_exiftool_json(
+            [{"SourceFile": p,
+              "SubSecDateTimeOriginal": "2026:07:12 10:44:02.03-04:00",
+              "FocusBracketingDepthComposite": 1} for p in paths],
+            renamed_folders,
+        )
+
+    monkeypatch.setattr(stackcopy, "read_canon_stack_metadata", fake_metadata)
+    args = stackcopy.parse_arguments(
+        ["--canon-import", str(source), str(tmp_path / "Stacked Images"),
+         "--name-filter", "laurel hill state park", "--plan-json"]
+    )
+    assert stackcopy.run_canon_import(args) == 0
+    assert seen["paths"] == [
+        "Laurel Hill State Park 0001.CR3",
+        "Laurel Hill State Park 0002.CR3",
+        "Laurel Hill State Park 0003.JPG",
+    ]
+    assert seen["renamed"] == {"20260712"}
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stacks"] == 1
+    assert payload["stack_inputs"] == 2
+    assert payload["others"] == 0

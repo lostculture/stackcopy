@@ -2886,7 +2886,9 @@ CANON_STACK_TAGS = (
 )
 
 
-def read_canon_stack_metadata(paths: list[str]) -> list[canon_stacks.CanonFrame]:
+def read_canon_stack_metadata(
+    paths: list[str], renamed_folders: frozenset[str] = frozenset()
+) -> list[canon_stacks.CanonFrame]:
     """Read Canon depth-composite MakerNotes in bounded ExifTool batches.
 
     Returns one canon_stacks.CanonFrame per readable camera file.  ExifTool is
@@ -2906,7 +2908,7 @@ def read_canon_stack_metadata(paths: list[str]) -> list[canon_stacks.CanonFrame]
             "fall back to heuristic stack detection."
         )
         return canon_stacks.records_from_exiftool_json(
-            [{"SourceFile": path} for path in paths]
+            [{"SourceFile": path} for path in paths], renamed_folders
         )
 
     collected: list[dict] = []
@@ -2957,7 +2959,7 @@ def read_canon_stack_metadata(paths: list[str]) -> list[canon_stacks.CanonFrame]
             f"{degraded_files} file(s). Those files fall back to heuristic "
             "stack detection."
         )
-    return canon_stacks.records_from_exiftool_json(collected)
+    return canon_stacks.records_from_exiftool_json(collected, renamed_folders)
 
 
 @dataclass(frozen=True)
@@ -3089,7 +3091,7 @@ def build_canon_import_plan(
     claimed_sources: set[str] = set()
     grouped_keys: set[tuple[str, int]] = set()
     for group in groups:
-        grouped_keys.add((group.output_jpg.folder, group.output_jpg.number))
+        grouped_keys.add((*group.output_jpg.run_key, group.output_jpg.number))
         frame_sources = tuple(source_path(frame) for frame in group.frames)
         jpg_src = source_path(group.output_jpg)
         # Claimed regardless of whether this group's own composite is in
@@ -3118,7 +3120,7 @@ def build_canon_import_plan(
     # raw sibling at its own number (i.e. not an ordinary RAW+JPG pair) that
     # was not explicitly ruled out as a composite.
     raw_keys = {
-        (record.folder, record.number)
+        (*record.run_key, record.number)
         for record in records
         if record.ext == canon_stacks.RAW_EXT
     }
@@ -3128,7 +3130,7 @@ def build_canon_import_plan(
             continue
         if record.depth_composite is False:
             continue
-        key = (record.folder, record.number)
+        key = (*record.run_key, record.number)
         if key in raw_keys or key in grouped_keys:
             continue
         unresolved.append(
@@ -3275,10 +3277,18 @@ def _canon_context_folder(
     return None
 
 
-def _scan_canon_files(folder_path: str) -> list[str]:
+def _scan_canon_files(folder_path: str, recursive: bool = True) -> list[str]:
     """List CR3/JPG files under one camera folder."""
     scan_exts = (canon_stacks.RAW_EXT, *canon_stacks.JPG_EXTS)
     try:
+        if not recursive:
+            with os.scandir(folder_path) as entries:
+                return [
+                    entry.path
+                    for entry in entries
+                    if entry.is_file()
+                    and os.path.splitext(entry.name)[1].lower() in scan_exts
+                ]
         return [
             os.path.join(root, name)
             for root, _dirs, names in os.walk(folder_path)
@@ -3287,6 +3297,14 @@ def _scan_canon_files(folder_path: str) -> list[str]:
         ]
     except OSError:
         return []
+
+
+def _canon_name_filter(paths: list[str], text: str | None) -> list[str]:
+    """Keep only files whose name contains ``text`` (case-insensitive)."""
+    if not text:
+        return paths
+    needle = text.casefold()
+    return [path for path in paths if needle in os.path.basename(path).casefold()]
 
 
 def _canon_frame_dest(
@@ -3362,12 +3380,32 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
         return 1
 
     source_root, target_folders = _canon_scan_targets(source_dir)
+    name_filter = getattr(args, "name_filter", None)
 
     paths: list[str] = []
     for folder_path in target_folders.values():
-        paths.extend(_scan_canon_files(folder_path))
+        paths.extend(_canon_name_filter(_scan_canon_files(folder_path), name_filter))
 
-    context = _canon_context_folder(source_root, target_folders)
+    # No camera folders: SRC_DIR may be a folder of already-renamed files
+    # ("Laurel Hill State Park 0028.JPG"). Only its own top level is read --
+    # a subfolder there is the user's, not the camera's.
+    renamed_folders: frozenset[str] = frozenset()
+    if not target_folders:
+        renamed_paths = _canon_name_filter(
+            _scan_canon_files(source_dir, recursive=False), name_filter
+        )
+        if renamed_paths:
+            normalized = os.path.normpath(source_dir)
+            source_root = os.path.dirname(normalized)
+            target_folders = {os.path.basename(normalized): source_dir}
+            renamed_folders = frozenset(target_folders)
+            paths.extend(renamed_paths)
+
+    context = (
+        None
+        if renamed_folders
+        else _canon_context_folder(source_root, target_folders)
+    )
     if context is not None:
         context_name, context_path = context
         context_paths = _scan_canon_files(context_path)
@@ -3379,7 +3417,7 @@ def run_canon_import(args, plan_json_stdout=None) -> int:
             )
             paths.extend(context_paths)
 
-    records = read_canon_stack_metadata(paths)
+    records = read_canon_stack_metadata(paths, renamed_folders)
     plan = build_canon_import_plan(
         records, dest_dir, singles_dir, source_root,
         target_folders=set(target_folders),
@@ -3951,6 +3989,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--name-filter",
+        metavar="TEXT",
+        help=(
+            "With --canon-import, only import files whose name contains "
+            "TEXT (case-insensitive), e.g. \"Laurel Hill State Park\"."
+        ),
+    )
     parser.add_argument(
         "--singles-dir",
         metavar="DIR",

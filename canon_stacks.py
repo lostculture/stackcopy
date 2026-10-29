@@ -16,7 +16,15 @@ from datetime import datetime
 # Canon writes IMG_0001.CR3; Olympus writes P7310001.ORF.  Stackcopy's own
 # NUMERIC_STEM_REGEX requires six digits and therefore never matches Canon.
 CANON_STEM_REGEX = re.compile(r"^([A-Za-z0-9_-]*?)(\d{4,})$")
-CAMERA_FOLDER_REGEX = re.compile(r"^(\d{3})([A-Za-z0-9_]{5})$")
+# A camera folder's five-character tag always has a non-digit in it (EOSR6,
+# _PANA, Canon's by-month 100_0728); a date folder such as 20260712 must not
+# pass for one.
+CAMERA_FOLDER_REGEX = re.compile(r"^(\d{3})((?=\d*[A-Za-z_])[A-Za-z0-9_]{5})$")
+# A Lightroom-renamed folder keeps the camera's sequence but not its names:
+# "Laurel Hill State Park 0028.JPG".  The prefix is the series; several can
+# share one folder, each with its own independent numbering.  Lightroom pads
+# only to three digits below 1000 ("... 013.JPG"), so any digit run counts.
+RENAMED_STEM_REGEX = re.compile(r"^(.*?)\s*(\d+)$")
 
 RAW_EXT = ".cr3"
 JPG_EXTS = (".jpg", ".jpeg")
@@ -34,6 +42,12 @@ class CanonFrame:
     timestamp: float | None = None
     depth_composite: bool | None = None
     image_count: int | None = None
+    series: str = ""
+
+    @property
+    def run_key(self) -> tuple[str, str]:
+        """The numbering this frame belongs to: its folder and its series."""
+        return (self.folder, self.series)
 
 
 def _parse_timestamp(text: str | None) -> float | None:
@@ -81,8 +95,14 @@ def _as_bool(value) -> bool | None:
     return None
 
 
-def records_from_exiftool_json(payload) -> list[CanonFrame]:
-    """Turn ExifTool JSON into frames, discarding anything not a camera file."""
+def records_from_exiftool_json(
+    payload, renamed_folders: frozenset[str] | set[str] = frozenset()
+) -> list[CanonFrame]:
+    """Turn ExifTool JSON into frames, discarding anything not a camera file.
+
+    ``renamed_folders`` names folders accepted even though they are not
+    camera folders; their files are read as "<series> NNNN.ext".
+    """
     frames: list[CanonFrame] = []
     if not isinstance(payload, list):
         return frames
@@ -96,13 +116,16 @@ def records_from_exiftool_json(payload) -> list[CanonFrame]:
         if len(parts) < 2:
             continue
         folder, name = parts[-2], parts[-1]
-        if not CAMERA_FOLDER_REGEX.match(folder):
+        renamed = folder in renamed_folders
+        if not renamed and not CAMERA_FOLDER_REGEX.match(folder):
             continue
         stem, _, extension = name.rpartition(".")
         ext = f".{extension}".lower()
         if ext != RAW_EXT and ext not in JPG_EXTS:
             continue
-        stem_match = CANON_STEM_REGEX.match(stem)
+        stem_match = (RENAMED_STEM_REGEX if renamed else CANON_STEM_REGEX).match(
+            stem
+        )
         if not stem_match:
             continue
         timestamp_text = item.get("SubSecDateTimeOriginal")
@@ -125,6 +148,7 @@ def records_from_exiftool_json(payload) -> list[CanonFrame]:
                     if isinstance(image_count, (int, float))
                     else None
                 ),
+                series=stem_match.group(1) if renamed else "",
             )
         )
     return frames
@@ -150,21 +174,23 @@ class CanonStackGroup:
     notes: tuple[str, ...] = field(default_factory=tuple)
 
 
-def _index(records: list[CanonFrame]) -> dict[str, dict[int, dict[str, CanonFrame]]]:
-    """folder -> number -> ext -> frame."""
-    index: dict[str, dict[int, dict[str, CanonFrame]]] = {}
+def _index(
+    records: list[CanonFrame],
+) -> dict[tuple[str, str], dict[int, dict[str, CanonFrame]]]:
+    """(folder, series) -> number -> ext -> frame."""
+    index: dict[tuple[str, str], dict[int, dict[str, CanonFrame]]] = {}
     for record in records:
-        index.setdefault(record.folder, {}).setdefault(record.number, {})[
+        index.setdefault(record.run_key, {}).setdefault(record.number, {})[
             record.ext
         ] = record
     return index
 
 
 def _preceding_run(
-    index, folder: str, number: int, limit: int = MAX_CANON_STACK_FRAMES
+    index, key: tuple[str, str], number: int, limit: int = MAX_CANON_STACK_FRAMES
 ) -> list[CanonFrame]:
     """CR3s immediately below ``number``, oldest first, stopping at a gap."""
-    folder_index = index.get(folder, {})
+    folder_index = index.get(key, {})
     run: list[CanonFrame] = []
     probe = number - 1
     while probe >= 0 and len(run) < limit:
@@ -250,22 +276,23 @@ def _count_note(jpg: CanonFrame, frames: list[CanonFrame]) -> tuple[str, ...]:
     return ()
 
 
-def _previous_folder(index, folder: str) -> str | None:
+def _previous_folder(index, key: tuple[str, str]) -> tuple[str, str] | None:
     """The numerically adjacent lower camera folder, if it is present.
 
     Mirrors stackcopy.previous_adjacent_camera_dir: only the immediately
     preceding folder number may extend a sequence across the boundary.
     """
+    folder, series = key
     match = CAMERA_FOLDER_REGEX.match(folder)
     if not match:
         return None
     number, tag = int(match.group(1)), match.group(2)
-    candidate = f"{number - 1:03d}{tag}"
+    candidate = (f"{number - 1:03d}{tag}", series)
     return candidate if candidate in index else None
 
 
 def _extend_across_folder(
-    index, folder: str, run: list[CanonFrame], jpg: CanonFrame
+    index, key: tuple[str, str], run: list[CanonFrame], jpg: CanonFrame
 ) -> list[CanonFrame] | None:
     """Borrow frames from the previous folder's tail to complete a stack.
 
@@ -279,7 +306,7 @@ def _extend_across_folder(
     different folder, so the result is still bounded by
     ``MAX_CROSS_FOLDER_GAP_SECONDS``.
     """
-    previous = _previous_folder(index, folder)
+    previous = _previous_folder(index, key)
     if previous is None:
         return None
     previous_numbers = [
@@ -325,11 +352,11 @@ def group_canon_stacks(records: list[CanonFrame]) -> list[CanonStackGroup]:
     groups: list[CanonStackGroup] = []
     jpgs = sorted(
         (r for r in records if r.ext == ".jpg"),
-        key=lambda r: (r.folder, r.number),
+        key=lambda r: (r.folder, r.series, r.number),
     )
     for jpg in jpgs:
         # A JPG sharing its number with a CR3 is an ordinary RAW+JPG pair.
-        if RAW_EXT in index.get(jpg.folder, {}).get(jpg.number, {}):
+        if RAW_EXT in index.get(jpg.run_key, {}).get(jpg.number, {}):
             continue
         # An explicit "not a depth composite" rules the JPG out.  Unknown
         # (no ExifTool) is deliberately allowed through to the heuristic.
@@ -338,12 +365,12 @@ def group_canon_stacks(records: list[CanonFrame]) -> list[CanonStackGroup]:
         # An empty run is not a dead end: the composite can legitimately be
         # the first file in its folder, with its stack entirely in the
         # previous one (see _extend_across_folder's docstring).
-        run = _preceding_run(index, jpg.folder, jpg.number)
+        run = _preceding_run(index, jpg.run_key, jpg.number)
         frames = _anchor_cut(run, jpg)
         confidence = CONFIDENCE_ANCHOR
         notes: tuple[str, ...] = ()
         if frames is None:
-            borrowed = _extend_across_folder(index, jpg.folder, run, jpg)
+            borrowed = _extend_across_folder(index, jpg.run_key, run, jpg)
             if borrowed is not None:
                 frames = borrowed
                 confidence = CONFIDENCE_ANCHOR_CROSSFOLDER

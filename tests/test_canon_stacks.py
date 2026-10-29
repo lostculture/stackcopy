@@ -454,3 +454,75 @@ def test_composite_with_no_local_frames_respects_time_limit():
         timestamp_text="match", timestamp=100000.0, depth_composite=True,
     )
     assert canon_stacks.group_canon_stacks([old, jpg]) == []
+
+
+def _renamed_payload(series, numbers_cr3, jpg_number, anchor):
+    """A renamed stack: CR3 frames 0.09 s apart, composite timed at the first."""
+    items = []
+    for offset, number in enumerate(numbers_cr3):
+        items.append({
+            "SourceFile": f"20260712/{series} {number:04d}.CR3",
+            "SubSecDateTimeOriginal": f"2026:07:12 09:58:{anchor + offset:02d}.00-04:00",
+            "FocusBracketingDepthComposite": 1,
+        })
+    items.append({
+        "SourceFile": f"20260712/{series} {jpg_number:04d}.JPG",
+        "SubSecDateTimeOriginal": f"2026:07:12 09:58:{anchor:02d}.00-04:00",
+        "FocusBracketingDepthComposite": 1,
+    })
+    return items
+
+
+def test_renamed_folder_is_read_only_when_named():
+    payload = _renamed_payload("Laurel Hill State Park", range(3, 6), 6, 10)
+    assert canon_stacks.records_from_exiftool_json(payload) == []
+    frames = canon_stacks.records_from_exiftool_json(payload, {"20260712"})
+    assert len(frames) == 4
+    assert {f.series for f in frames} == {"Laurel Hill State Park"}
+    assert sorted(f.number for f in frames) == [3, 4, 5, 6]
+
+
+def test_renamed_series_sharing_a_folder_never_mix():
+    """Croatia 0006 and Laurel Hill 0006 sit in one folder with the same
+    numbers; each composite must take only its own series' frames."""
+    payload = (
+        _renamed_payload("Laurel Hill State Park", range(3, 6), 6, 10)
+        + _renamed_payload("Croatia", range(2, 6), 6, 30)
+    )
+    records = canon_stacks.records_from_exiftool_json(payload, {"20260712"})
+    groups = groups_by_output(canon_stacks.group_canon_stacks(records))
+    laurel = groups["Laurel Hill State Park 0006.JPG"]
+    croatia = groups["Croatia 0006.JPG"]
+    assert laurel.confidence == canon_stacks.CONFIDENCE_ANCHOR
+    assert [f.name for f in laurel.frames] == [
+        f"Laurel Hill State Park {n:04d}.CR3" for n in (3, 4, 5)
+    ]
+    assert [f.name for f in croatia.frames] == [
+        f"Croatia {n:04d}.CR3" for n in (2, 3, 4, 5)
+    ]
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [("108EOSR6", True), ("100_0728", True), ("100CANON", True),
+     ("20260712", False), ("20260730", False)],
+)
+def test_date_folder_is_not_a_camera_folder(name, expected):
+    assert bool(canon_stacks.CAMERA_FOLDER_REGEX.match(name)) is expected
+
+
+def test_renamed_numbers_padded_to_three_digits_still_parse():
+    """Lightroom writes "Laurel Hill State Park 013.JPG" below 1000."""
+    payload = [
+        {"SourceFile": "20260712/Laurel Hill State Park 013.JPG"},
+        {"SourceFile": "20260712/Laurel Hill State Park 1017.CR3"},
+        {"SourceFile": "20260802/NEMF 2026 0028.JPG"},
+    ]
+    frames = canon_stacks.records_from_exiftool_json(
+        payload, {"20260712", "20260802"}
+    )
+    assert [(f.series, f.number) for f in frames] == [
+        ("Laurel Hill State Park", 13),
+        ("Laurel Hill State Park", 1017),
+        ("NEMF 2026", 28),
+    ]
