@@ -229,6 +229,10 @@ def dng_is_complete(path: str) -> bool:
 
 def _tiff_within_bounds(handle, size: int) -> bool:
     header = handle.read(8)
+    # Space reserved but never written reads back as zeros: no converter
+    # output, however unusual, starts that way.
+    if not header.strip(b"\x00"):
+        return False
     if not any(m.startswith(header[:4]) for m in _TIFF_MAGICS):
         return True
     if len(header) < 8 or header[:4] not in _TIFF_MAGICS:

@@ -2,6 +2,21 @@
 
 ## **Unreleased**
 
+- **`--canon-import` reads folders Lightroom has already renamed.** A source
+  with no camera folders in it, such as `Pictures\20260712` holding
+  `Laurel Hill State Park 013.CR3`, is now imported directly: the rename keeps
+  the camera's sequence, so stacks group exactly as they do on the card. Several
+  names can share one folder, each numbered from 001, and are never mixed into
+  each other's stacks. Only the folder's own files are read, not its subfolders.
+  The new `--name-filter TEXT` imports only files whose name contains TEXT.
+  A date folder such as `20260712` is also no longer mistaken for a camera folder.
+
+- **A DNG that starts with zeros is no longer treated as finished.** One frame
+  of a real import was 9 MiB with its first 172 kB all zeros: space reserved but
+  never written. It does not begin like a DNG, so the truncation check passed it
+  without looking, resume skipped it, and Helicon failed that stack on every
+  retry. Such a file is now redone like a truncated one.
+
 - **A Helicon error dialog no longer stalls a render for its whole timeout.**
   When Helicon Focus fails a render it opens a modal "Rendering failed" dialog,
   even under `-silent -noprogress`, and then waits for a click that never comes.

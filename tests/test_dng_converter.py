@@ -437,6 +437,14 @@ def test_dng_is_complete_rejects_an_empty_file(tmp_path):
     assert not dng_converter.dng_is_complete(str(path))
 
 
+def test_dng_is_complete_rejects_a_zero_filled_file(tmp_path):
+    """NEMF 2026 0016.dng: 9 MiB with its first 172 kB all zeros -- space
+    reserved but never written. Resume skipped it, Helicon failed on it."""
+    path = tmp_path / "zeros.dng"
+    path.write_bytes(b"\x00" * 4096 + _tiff_bytes())
+    assert not dng_converter.dng_is_complete(str(path))
+
+
 def test_a_truncated_dng_from_an_exit_zero_converter_is_not_published(tmp_path):
     """The converter can crash mid-frame and still exit 0.
 
